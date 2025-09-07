@@ -16,7 +16,7 @@ async fn shutdown(manager: Arc<RwLock<RoomManager>>, room_path: &str, word_path:
 #[tokio::main]
 async fn main() {
     // ボットのトークン（環境変数から取得も可）
-    let token = std::env::var("DISCORD_BOT_KEY").expect("DISCORD_BOT_KEY not set");
+    let token = std::env::var("DISCORD_BOT_TOKEN").expect("DISCORD_BOT_KEY not set");
     let room_path = std::env::var("ROOMS_PATH").expect("ROOMS_PATH not set. example: ./save/rooms.json");
     let word_path = std::env::var("WORDS_PATH").expect("WORDS_PATH not set. example: ./save/words/");
     let manager = arc_rwlock!(RoomManager::load_or_new(&room_path).await);
