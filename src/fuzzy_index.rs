@@ -1,5 +1,5 @@
 use bincode::{Decode, Encode};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc};
@@ -68,6 +68,7 @@ impl Node {
 #[derive(Debug, Encode, Decode)]
 pub struct FuzzyIndex {
     root: Option<Node>,
+    words_set: HashSet<String>, // 完全一致検索用
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -92,28 +93,46 @@ pub enum IndexError {
 
 impl FuzzyIndex {
     pub fn new() -> Self {
-        Self { root: None }
+        Self { root: None, words_set: HashSet::new() }
     }
 
     /// 単語を追加
-    pub fn add_word<S: Into<String>>(&mut self, word: S) {
+    pub fn add_word<S: Into<String>>(&mut self, word: S) -> bool {
         let word = word.into();
-        if let Some(root) = &mut self.root {
-            root.insert(word);
-        } else {
-            self.root = Some(Node::new(word));
+
+        if self.contains(&word) {
+            return false;
         }
+
+        if let Some(root) = &mut self.root {
+            root.insert(word.clone());
+        } else {
+            self.root = Some(Node::new(word.clone()));
+        }
+
+        self.words_set.insert(word);
+
+        return true;
     }
 
     /// 単語群を追加
-    pub fn add_words<I, S>(&mut self, words: I)
+    pub fn add_words<I, S>(&mut self, words: I) -> Vec<String>
     where
         I: IntoIterator<Item = S>,
-        S: Into<String>,
+        S: Into<String> + Clone,
     {
+        let mut added = Vec::new();
         for word in words {
-            self.add_word(word);
+            if self.add_word(word.clone()) {
+                added.push(word.into());
+            }
         }
+        added
+    }
+
+    /// 完全一致単語検索
+    pub fn contains(&self, query: &str) -> bool {
+        self.words_set.contains(query)
     }
 
     /// 曖昧検索（レーベンシュタイン距離）
@@ -164,19 +183,19 @@ impl SharedFuzzyIndex {
     }
 
     /// 単語追加
-    pub async fn add_word(&self, word: String) {
+    pub async fn add_word(&self, word: String) -> bool {
         let mut index = self.inner.write().await;
-        index.add_word(word);
+        index.add_word(word)
     }
 
     // 単語群追加
-    pub async fn add_words<I, S>(&self, words: I)
+    pub async fn add_words<I, S>(&self, words: I) -> Vec<String>
     where
         I: IntoIterator<Item = S>,
-        S: Into<String>,
+        S: Into<String> + Clone,
     {
         let mut idx = self.inner.write().await;
-        idx.add_words(words);
+        idx.add_words(words)
     }
 
     /// 曖昧検索

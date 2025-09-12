@@ -27,7 +27,7 @@ pub struct RoomState {
     pub vote_state: VoteState,          // 投票状態
 
     #[serde(skip)]
-    pub index: Option<SharedFuzzyIndex>,
+    index: Option<SharedFuzzyIndex>,
 }
 
 #[derive(Debug, Error)]
@@ -50,6 +50,18 @@ impl RoomState {
             vote_state: VoteState::default(),
             index: None
         }
+    }
+
+    pub async fn get_index_or_new(&mut self, word_path: &str) -> SharedFuzzyIndex {
+        if let Some(index) = self.index.as_ref() {
+            return index.clone();
+        }
+
+        // ロードして self.index にセット
+        self.load_words(word_path).await;
+
+        // load_words で self.index は Some に設定されるはずなので unwrap で返す
+        self.index.as_ref().unwrap().clone()
     }
 
     pub async fn load_words(&mut self, root_path: &str) {
@@ -109,19 +121,32 @@ impl RoomManager {
         rooms_lock.entry(room_id).or_insert(arc_rwlock!(RoomState::new(room_id)));
     }
 
-    pub async fn get_room(&self, room_id: u64) -> Option<RoomState> {
-        let rooms_lock = self.rooms.read().await;
-        if let Some(room_ref) = rooms_lock.get(&room_id) {
+    pub async fn get_or_new_room(&self, room_id: u64) -> RoomState {
+        // 1. まず読み取り専用で存在チェック
+        if let Some(room_ref) = self.rooms.read().await.get(&room_id) {
             let room_lock = room_ref.read().await;
-            return Some(room_lock.clone());
+            return room_lock.clone();
         }
 
-        return None;
+        // 2. 存在しなければ書き込み用ロックで新規作成
+        let mut rooms_lock = self.rooms.write().await;
+        // 他のスレッドで作られていないか再チェック
+        let room_ref = rooms_lock.entry(room_id).or_insert_with(|| arc_rwlock!(RoomState::new(room_id)));
+        let room_lock = room_ref.read().await;
+        room_lock.clone()
     }
 
-    pub async fn get_room_mut(&self, room_id: u64) -> Option<Arc<RwLock<RoomState>>> {
-        let rooms_lock = self.rooms.write().await;
-        rooms_lock.get(&room_id).cloned()
+    pub async fn get_or_new_room_mut(&self, room_id: u64) -> Arc<RwLock<RoomState>> {
+        // 書き込みロックを取得
+        let mut rooms_lock = self.rooms.write().await;
+
+        // 存在しなければ新規作成
+        let room_ref = rooms_lock
+            .entry(room_id)
+            .or_insert_with(|| arc_rwlock!(RoomState::new(room_id)))
+            .clone(); // Arc を複製して返す
+
+        room_ref
     }
 
     pub async fn has_room(&self, room_id: u64) -> bool {

@@ -4,7 +4,7 @@ use regex::Regex;
 use serenity::all::{Context, GuildId, Message};
 use tokio::sync::RwLock;
 
-use crate::{actions::{add_queue, find_words, set_queue, try_word, BotContext, SearchOptions}, message::generate_register_message, room::RoomManager, MatchMode};
+use crate::{actions::{add_queue, add_words, find_words, set_queue, try_word, BotContext, SearchOptions}, message::generate_register_message, room::RoomManager, MatchMode};
 
 use crate::commands::*;
 
@@ -45,9 +45,11 @@ pub async fn handle(ctx: Context, msg: Message, bot_ctx: BotContext, manager: Ar
     }
 
     // コマンドは追加されたチャンネルのみで有効
-    let manager_lock = manager.read().await;
-    if !manager_lock.has_room(bot_ctx.room_id).await {
-        return;
+    {
+        let manager_lock = manager.read().await;
+        if !manager_lock.has_room(bot_ctx.room_id).await {
+            return;
+        }
     }
 
     // try_word の正規表現マッチ
@@ -89,6 +91,30 @@ pub async fn handle(ctx: Context, msg: Message, bot_ctx: BotContext, manager: Ar
         return;
     }
 
+    // words 追加コマンド
+    if msg.content.starts_with("!addwords") {
+        // 1. "!addwords" を削除して前後の空白をトリム
+        let trimmed = msg.content.trim_start_matches("!addwords").trim();
+
+        // 2. 正規表現でチェック
+        let re = Regex::new(r"^[a-zA-Z\s,]+$").unwrap();
+        if !re.is_match(trimmed) {
+            (bot_ctx.send)("入力入力形式が正しくありません。^!addwords [a-zA-Z\\s,]+$".to_string()).await;
+            return;
+        }
+
+        // 3. カンマで分割、trim + lowercase
+        let words: Vec<String> = trimmed
+            .split(',')
+            .map(|w| w.trim().to_lowercase())
+            .filter(|w| !w.is_empty()) // 空文字列を除外
+            .collect();
+
+        // 4. 単語追加
+        let mut manager_write = manager.write().await;
+        add_words(&bot_ctx, &mut *manager_write, &words).await;
+        return;
+    }
 }
 
 // 特定のギルドにコマンドを追加

@@ -144,3 +144,19 @@ pub fn generate_find_message(word: &str, words: &[String]) -> String {
         )
     }
 }
+
+pub fn generate_added_words_message(words: &[String]) -> String {
+    if words.is_empty() {
+        return "追加された単語はありません。".to_string();
+    }
+
+    let mut message = String::from("以下の単語を追加しました。```\n");
+
+    for word in words {
+        message.push_str(word);
+        message.push('\n');
+    }
+
+    message.push_str("```");
+    message
+}

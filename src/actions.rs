@@ -1,10 +1,10 @@
 use std::{collections::HashSet, pin::Pin, sync::Arc};
 
-use serenity::all::{ChannelId, Context, Reaction, ReactionType};
+use serenity::all::{Context, Reaction, ReactionType};
 
 use crate::{
     arc_rwlock, bot_handler::Handler, message::{
-        generate_add_queue_message, generate_find_message, generate_set_queue_message, TryMessageBuilder
+        generate_add_queue_message, generate_added_words_message, generate_find_message, generate_set_queue_message, TryMessageBuilder
     }, room::{RoomManager, VoteState}, util::get_word_mean_jp, MatchMode, SharedFuzzyIndex
 };
 
@@ -20,9 +20,11 @@ pub struct BotContext {
 }
 
 pub async fn try_word(ctx: &BotContext, manager: &RoomManager, user_id: u64, word: &str, _message_id: u64) {
-    let Some(room_arc) = manager.get_room_mut(ctx.room_id).await else {
-        return; // Noneであれば何もしない
-    };
+    if !manager.has_room(ctx.room_id).await {
+        return; // ルームがなければ何もしない
+    }
+
+    let room_arc = manager.get_or_new_room_mut(ctx.room_id).await;
 
     // 投票基本情報
     {
@@ -59,15 +61,7 @@ pub async fn try_word(ctx: &BotContext, manager: &RoomManager, user_id: u64, wor
         async {
             let index = {
                 let mut room = room_arc.write().await;
-                let mut index = room.index.clone();
-                if index.is_none() {
-                    room.load_words(&ctx.word_path).await;
-                    index = room.index.clone();
-                }
-
-                if index.is_none() { return };
-
-                index.unwrap()
+                room.get_index_or_new(&ctx.word_path).await
             };
 
             let mearged_words = default_find(&index, word.to_string()).await;
@@ -112,9 +106,11 @@ pub async fn vote(
     cancel: bool,
 ) {
     // 1. 対象の room を取得
-    let Some(room_arc) = manager.get_room_mut(ctx.room_id).await else {
-        return; // room がなければ終了
-    };
+    if !manager.has_room(ctx.room_id).await {
+        return; // ルームがなければ何もしない
+    }
+
+    let room_arc = manager.get_or_new_room_mut(ctx.room_id).await;
 
     // 2. vote_state のチェック
     let (message_id, word) = {
@@ -180,15 +176,9 @@ pub async fn vote(
             room.vote_state = Default::default();
 
             // 単語をリストに追加
-            let mut index = room.index.clone();
-            if index.is_none() {
-                room.load_words(&ctx.word_path).await;
-                index = room.index.clone();
-            }
+            let index = room.get_index_or_new(&ctx.word_path).await;
+            index.add_word(word.clone()).await;
 
-            if let Some(index) = index {
-                index.add_word(word.clone()).await;
-            }
         } else if bad_count >= majority {
             // 4b. 過半数 NO
             let mut message = format!("投票終了！結果: NO({}) / YES({})\n\"{}\"は否決されました。", bad_count, good_count, word);
@@ -229,12 +219,15 @@ pub async fn set_queue(ctx: &BotContext, manager: &RoomManager, users: Vec<u64>)
     let message = generate_set_queue_message(&users);
 
     // room に所有権を移す
-    if let Some(room_arc) = manager.get_room_mut(ctx.room_id).await {
-        let mut room = room_arc.write().await;
-        room.user_queue = users;
+    if !manager.has_room(ctx.room_id).await {
+        return; // ルームがなければ何もしない
     }
 
-    // 送信タスクをバックグラウンドで spawn
+    let room_arc = manager.get_or_new_room_mut(ctx.room_id).await;
+    let mut room = room_arc.write().await;
+    room.user_queue = users;
+
+    // 送信タスクをバックグラウンドで 
     let response_future = (ctx.send)(message);
     tokio::spawn(async move {
         let _ = response_future.await;
@@ -243,9 +236,11 @@ pub async fn set_queue(ctx: &BotContext, manager: &RoomManager, users: Vec<u64>)
 
 pub async fn add_queue(ctx: &BotContext, manager: &RoomManager, user_id: u64) {
     // 対象の room を取得
-    let Some(room_arc) = manager.get_room_mut(ctx.room_id).await else {
-        return;
-    };
+    if !manager.has_room(ctx.room_id).await {
+        return; // ルームがなければ何もしない
+    }
+
+    let room_arc = manager.get_or_new_room_mut(ctx.room_id).await;
 
     let mut room = room_arc.write().await;
 
@@ -263,6 +258,21 @@ pub async fn add_queue(ctx: &BotContext, manager: &RoomManager, user_id: u64) {
     });
 }
 
+pub async fn add_words(ctx: &BotContext, manager: &mut RoomManager, words: &Vec<String>) {
+    let room_lock = manager.get_or_new_room_mut(ctx.room_id).await;
+
+    // 1. 全単語検索 + フィルター
+    let index = {
+        let mut room = room_lock.write().await;
+        room.get_index_or_new(&ctx.word_path).await
+    };
+
+    let added = index.add_words(words).await;
+
+    let added_message = generate_added_words_message(&added);
+    (ctx.send)(added_message).await;
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
     pub fuzzy_distance: Option<usize>,       // None なら fuzzy は行わない
@@ -270,18 +280,11 @@ pub struct SearchOptions {
 }
 
 pub async fn find_words(ctx: &BotContext, manager: &RoomManager, word: &str, options: SearchOptions, global_message: bool) {
-    let Some(room_arc) = manager.get_room_mut(ctx.room_id).await else {
-        return;
-    };
+    let room_arc = manager.get_or_new_room_mut(ctx.room_id).await;
 
     let mut room = room_arc.write().await;
 
-    let index = if let Some(index) = &room.index {
-        index.clone() // 既にロード済みならそのまま使用
-    } else {
-        room.load_words(&ctx.word_path).await; // 未ロードならロード
-        room.index.as_ref().unwrap().clone() // ロード後に取得
-    };
+    let index = room.get_index_or_new(&ctx.word_path).await;
 
     // like_list と match_list は Vec<String>
     let like_list = if let Some(dist) = options.fuzzy_distance {
@@ -334,10 +337,9 @@ pub async fn reaction_changed(handler: &Handler, ctx: &Context, reaction: &React
     // 最新の投票以外スキップ
     let is_latest_vote = {
         let room_lock = handler.manager.read().await;
-        match room_lock.get_room(reaction.channel_id.get()).await {
-            Some(room) => room.vote_state.vote_message.unwrap_or(0) == reaction.message_id.get(),
-            None => false,
-        }
+
+        let room = room_lock.get_or_new_room(reaction.channel_id.get()).await;
+        room.vote_state.vote_message.unwrap_or(0) == reaction.message_id.get()
     };
 
     if !is_latest_vote {
