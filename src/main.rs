@@ -1,6 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{io::Write, sync::Arc, time::Duration};
 
 use chrono::Local;
+use dotenv::dotenv;
 use serenity::{all::GatewayIntents, Client};
 use shiritori_v3::{arc_rwlock, bot_handler::Handler, room::RoomManager};
 use tokio::{signal, sync::RwLock, time};
@@ -8,14 +9,16 @@ use tokio::{signal, sync::RwLock, time};
 // 終了用関数
 async fn shutdown(manager: Arc<RwLock<RoomManager>>, room_path: &str, word_path: &str) {
     println!("終了処理開始...");
-    let _ = manager.write().await.save_all(room_path, word_path);
+    let _ = manager.write().await.save_all(room_path, word_path).await;
     println!("Bot終了");
+    std::io::stdout().flush().unwrap();
     std::process::exit(0); // 明示的にプロセス終了
 }
 
 #[tokio::main]
 async fn main() {
     // ボットのトークン（環境変数から取得も可）
+    dotenv().ok();
     let token = std::env::var("DISCORD_BOT_TOKEN").expect("DISCORD_BOT_KEY not set");
     let room_path = std::env::var("ROOMS_PATH").expect("ROOMS_PATH not set. example: ./save/rooms.json");
     let word_path = std::env::var("WORDS_PATH").expect("WORDS_PATH not set. example: ./save/words/");

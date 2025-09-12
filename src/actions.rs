@@ -1,6 +1,6 @@
 use std::{collections::HashSet, pin::Pin, sync::Arc};
 
-use serenity::all::{Context, Reaction, ReactionType};
+use serenity::all::{ChannelId, Context, Reaction, ReactionType};
 
 use crate::{
     arc_rwlock, bot_handler::Handler, message::{
@@ -330,6 +330,19 @@ pub async fn reaction_changed(handler: &Handler, ctx: &Context, reaction: &React
         ReactionType::Unicode(emoji) if emoji == "👎" => false,
         _ => { return },
     };
+
+    // 最新の投票以外スキップ
+    let is_latest_vote = {
+        let room_lock = handler.manager.read().await;
+        match room_lock.get_room(reaction.channel_id.get()).await {
+            Some(room) => room.vote_state.vote_message.unwrap_or(0) == reaction.message_id.get(),
+            None => false,
+        }
+    };
+
+    if !is_latest_vote {
+        return;
+    }
 
     if add {
         // 排他制御: 👍 なら 👎 を削除、👎 なら 👍 を削除

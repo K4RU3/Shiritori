@@ -1,8 +1,8 @@
 use serde::{Serialize, Deserialize};
 use serenity::futures::future::join_all;
 use thiserror::Error;
-use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::Arc, vec};
-use tokio::{self, sync::RwLock};
+use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, sync::Arc, vec};
+use tokio::{self, sync::RwLock, fs};
 
 use crate::{arc_rwlock, fuzzy_index::IndexError, message::TryMessageBuilder, SharedFuzzyIndex};
 
@@ -37,6 +37,9 @@ pub enum SaveError {
 
     #[error(transparent)]
     Index(#[from] IndexError),
+
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
 impl RoomState {
@@ -76,9 +79,12 @@ impl RoomState {
             return Err(SaveError::NotLoaded);
         }
 
-        let root_path = root_path.to_string();
-
         let path = PathBuf::from(format!("{}word_{}.idx", root_path, self.room_id));
+
+        // 親ディレクトリを作成（存在しなければ作成）
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
 
         let index = self.index.as_ref().unwrap();
 
@@ -175,11 +181,13 @@ impl RoomManager {
     }
 
     pub async fn from_json(json: &str) -> Self {
-        let map: HashMap<u64, RoomState> = serde_json::from_str(json).unwrap();
+        // Vec<RoomState> として読み込む
+        let rooms_vec: Vec<RoomState> = serde_json::from_str(json).unwrap();
 
-        let wrapped: HashMap<u64, Arc<RwLock<RoomState>>> = map
+        // Vec を HashMap に変換
+        let wrapped: HashMap<u64, Arc<RwLock<RoomState>>> = rooms_vec
             .into_iter()
-            .map(|(id, room)| (id, Arc::new(RwLock::new(room))))
+            .map(|room| (room.room_id, Arc::new(RwLock::new(room))))
             .collect();
 
         Self {
@@ -188,8 +196,18 @@ impl RoomManager {
     }
 
     pub async fn save_to_file(&self, path: &str) -> tokio::io::Result<()> {
-        let json_str = self.to_json();          // String を作成
-        tokio::fs::write(path, json_str.await.as_bytes()).await
+        let path = Path::new(path);
+
+        // 親ディレクトリを作成（存在しなければ作成）
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+
+        // JSON文字列を取得
+        let json_str = self.to_json().await;
+
+        // ファイルを書き込み
+        fs::write(path, json_str.as_bytes()).await
     }
 
     pub async fn load_or_new(path: &str) -> Self {
@@ -200,7 +218,9 @@ impl RoomManager {
     }
 
     pub async fn save_all(&mut self, rooms_path: &str, words_path: &str) {
+        println!("saving json to file");
         let _ = self.save_to_file(rooms_path).await;
+        println!("saving words to file");
         self.save_all_words(words_path).await;
     }
 }
