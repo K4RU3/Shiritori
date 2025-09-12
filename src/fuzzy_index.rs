@@ -136,7 +136,7 @@ impl FuzzyIndex {
 
     /// 保存
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<(), IndexError> {
-        let config = bincode::config::standard();
+        let config = bincode::config::standard().with_little_endian();
         let encoded: Vec<u8> = bincode::encode_to_vec(self, config)?;
         fs::write(path, encoded)?;
         Ok(())
