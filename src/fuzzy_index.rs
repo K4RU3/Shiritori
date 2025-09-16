@@ -49,9 +49,15 @@ impl Node {
 
     fn search_match(&self, query: &str, mode: MatchMode, results: &mut Vec<String>) {
         let matched = match mode {
-            MatchMode::Prefix => self.word.starts_with(query),
-            MatchMode::Suffix => self.word.ends_with(query),
-            MatchMode::Substring => self.word.contains(query),
+            MatchMode::Prefix => {
+                self.word.starts_with(query) || query.starts_with(&self.word)
+            }
+            MatchMode::Suffix => {
+                self.word.ends_with(query) || query.ends_with(&self.word)
+            }
+            MatchMode::Substring => {
+                self.word.contains(query) || query.contains(&self.word)
+            }
             MatchMode::Exact => self.word == query,
         };
 
