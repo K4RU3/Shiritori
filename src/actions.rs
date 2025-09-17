@@ -29,6 +29,7 @@ pub async fn try_word(ctx: &BotContext, manager: &RoomManager, user_id: u64, wor
     // 投票基本情報
     {
         let mut room = room_arc.write().await;
+        let voter: Vec<u64> = room.user_queue.iter().copied().filter(|&id| id != user_id).collect();
 
         room.vote_state = VoteState {
             target_user: Some(user_id),
@@ -36,7 +37,7 @@ pub async fn try_word(ctx: &BotContext, manager: &RoomManager, user_id: u64, wor
             vote_message: None,
             good_users: HashSet::new(),
             bad_users: HashSet::new(),
-            message_builder: arc_rwlock!(TryMessageBuilder::init(user_id, word.to_string(), room.user_queue.clone())),
+            message_builder: arc_rwlock!(TryMessageBuilder::init(user_id, word.to_string(), voter)),
         };
     }
 
@@ -119,6 +120,10 @@ pub async fn vote(
 
         let mid = if let Some(m) = vote_state.vote_message { m } else { return; };
         let w = if let Some(w) = &vote_state.target_word { w.clone() } else { return; };
+
+        if vote_state.target_user == Some(user_id) {
+            return; // 自投票キャンセル
+        }
 
         (mid, w)
     };
