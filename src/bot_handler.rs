@@ -127,7 +127,11 @@ pub async fn create_bot_context_from_interaction(
         let interaction = interaction.clone();
         Box::pin(async move {
             // 最初の返信がまだなら create_interaction_response、すでに返信済みなら followup
-            let _ = interaction.create_response(&ctx.http, CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content(content))).await;
+            let _ = interaction.create_response(&ctx.http, 
+                CreateInteractionResponse::Message(CreateInteractionResponseMessage::new()
+                    .content(content)
+                    .ephemeral(true)
+            )).await;
         }) as Pin<Box<dyn Future<Output = ()> + Send>>
     });
 
