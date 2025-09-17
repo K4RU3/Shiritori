@@ -98,15 +98,28 @@ pub fn generate_register_message(is_registered: bool) -> String {
     }
 }
 
-pub fn generate_set_queue_message(users: &[u64]) -> String {
+pub fn generate_set_queue_message(users: &[u64], current_users: &[u64]) -> String {
     if users.is_empty() {
-        return "参加者がいません。".to_string();
+        if current_users.is_empty() {
+            return "順番が設定されていません".to_string();
+        } else {
+            let current_list = current_users
+                .iter()
+                .map(|id| format!("<@{}>", id))
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            let next_user = format!("<@{}>", current_users[0]);
+            return format!(
+                "現在の順番: {}\n次は {} の番です。",
+                current_list, next_user
+            );
+        }
     }
 
     let user_list = users.iter()
         .map(|id| format!("<@{}>", id))
         .collect::<Vec<_>>()
-        .join(", ");
+        .join(" -> ");
 
     let next_user = format!("<@{}>", users[0]);
 

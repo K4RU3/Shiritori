@@ -215,9 +215,6 @@ pub async fn vote(
 }
 
 pub async fn set_queue(ctx: &BotContext, manager: &RoomManager, users: Vec<u64>) {
-    // まず参照でメッセージ生成
-    let message = generate_set_queue_message(&users);
-
     // room に所有権を移す
     if !manager.has_room(ctx.room_id).await {
         return; // ルームがなければ何もしない
@@ -225,7 +222,16 @@ pub async fn set_queue(ctx: &BotContext, manager: &RoomManager, users: Vec<u64>)
 
     let room_arc = manager.get_or_new_room_mut(ctx.room_id).await;
     let mut room = room_arc.write().await;
-    room.user_queue = users;
+    let prev_users = room.user_queue.clone();
+
+    // 参照でメッセージ生成
+    let message = generate_set_queue_message(&users, &prev_users);
+
+    // キュー設定
+    if !users.is_empty() {
+        room.user_queue = users;
+    }
+
 
     // 送信タスクをバックグラウンドで 
     let response_future = (ctx.send)(message);
