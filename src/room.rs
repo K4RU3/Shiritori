@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serenity::futures::future::join_all;
 use thiserror::Error;
 use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, sync::Arc, vec};
@@ -15,8 +15,37 @@ pub struct VoteState {
     pub good_users: HashSet<u64>,       // Good投票ユーザー
     pub bad_users: HashSet<u64>,        // Bad投票ユーザー
 
+    /*#[serde(
+        serialize_with = "serialize_builder",
+        deserialize_with = "deserialize_builder",
+        default
+    )]*/
     #[serde(skip)]
     pub message_builder: Arc<RwLock<TryMessageBuilder>>,
+}
+
+fn serialize_builder<S>(
+    builder: &Arc<tokio::sync::RwLock<TryMessageBuilder>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    // try_read() で同期的に読み込む
+    let guard = builder.try_read().map_err(|_| serde::ser::Error::custom("Failed to acquire read lock"))?;
+
+    // Clone してシリアライズ
+    guard.clone().serialize(serializer)
+}
+
+fn deserialize_builder<'de, D>(
+    deserializer: D,
+) -> Result<Arc<RwLock<TryMessageBuilder>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let b = TryMessageBuilder::deserialize(deserializer)?;
+    Ok(Arc::new(RwLock::new(b)))
 }
 
 /// ルームの状態

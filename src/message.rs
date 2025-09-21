@@ -1,4 +1,6 @@
-#[derive(Debug, Default)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TryMessageBuilder {
     pub user: Option<u64>,
     pub word: Option<String>,
