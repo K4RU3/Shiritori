@@ -24,6 +24,8 @@ pub async fn try_word(ctx: &BotContext, manager: &RoomManager, user_id: u64, wor
         return; // ルームがなければ何もしない
     }
 
+    let waiting_message = (ctx.send)("メッセージを構築中...".to_string());
+
     let room_arc = manager.get_or_new_room_mut(ctx.room_id).await;
 
     // 投票基本情報
@@ -48,7 +50,9 @@ pub async fn try_word(ctx: &BotContext, manager: &RoomManager, user_id: u64, wor
         room.vote_state.message_builder.read().await.build()
     };
 
-    let vote_message_id = (ctx.send)(message).await;
+    let vote_message_id = waiting_message.await;
+
+    (ctx.edit)(vote_message_id, message).await;
 
     // 投票メッセージ設定
     {
