@@ -15,12 +15,11 @@ pub struct VoteState {
     pub good_users: HashSet<u64>,       // Good投票ユーザー
     pub bad_users: HashSet<u64>,        // Bad投票ユーザー
 
-    /*#[serde(
+    #[serde(
         serialize_with = "serialize_builder",
         deserialize_with = "deserialize_builder",
         default
-    )]*/
-    #[serde(skip)]
+    )]
     pub message_builder: Arc<RwLock<TryMessageBuilder>>,
 }
 
