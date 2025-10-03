@@ -175,3 +175,14 @@ pub fn generate_added_words_message(words: &[String]) -> String {
     message.push_str("```");
     message
 }
+
+pub fn generate_skip_message(queue: Vec<u64>, skipped: Option<u64>, dist: usize) -> String {
+    if queue.len() < 2 || skipped.is_none() {
+        return "スキップできるユーザーがいません。".to_string();
+    }
+
+    format!(
+        "<@{}> から {}人 スキップしました！ 次は <@{}> の番です。",
+        skipped.unwrap(), dist, queue[0] 
+    )
+}

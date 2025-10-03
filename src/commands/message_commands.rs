@@ -4,7 +4,7 @@ use regex::Regex;
 use serenity::all::{Context, GuildId, Message};
 use tokio::sync::RwLock;
 
-use crate::{actions::{add_queue, add_words, find_words, set_queue, try_word, BotContext, SearchOptions}, message::generate_register_message, room::RoomManager, MatchMode};
+use crate::{actions::{add_queue, add_words, find_words, set_queue, skip, try_word, BotContext, SearchOptions}, message::generate_register_message, room::RoomManager, MatchMode};
 
 use crate::commands::*;
 
@@ -115,6 +115,20 @@ pub async fn handle(ctx: Context, msg: Message, bot_ctx: BotContext, manager: Ar
         add_words(&bot_ctx, &mut *manager_write, &words).await;
         return;
     }
+
+    // skip コマンド
+    if msg.content.starts_with("!skip") {
+        let parts: Vec<&str> = msg.content.split_whitespace().collect();
+        let mut len = 1;
+        
+        if parts.len() > 1 {
+            len = parts[1].parse().unwrap_or(1);
+        }
+
+        let manager_read = manager.read().await; // 読み取りロック
+
+        skip(&bot_ctx, &manager_read, len).await;
+    }
 }
 
 // 特定のギルドにコマンドを追加
@@ -122,5 +136,6 @@ pub async fn register_commands(ctx: &Context, guild_id: GuildId) {
     let _ = guild_id.set_commands(&ctx.http, vec![
         vote::command(),
         find::command(),
+        skip::command(),
     ]).await;
 }

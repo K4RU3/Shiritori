@@ -39,6 +39,7 @@ impl EventHandler for Handler {
             match command.data.name.as_str() {
                 "vote" => commands::vote::run(&bot_ctx, &manager, &command).await,
                 "find" => commands::find::run(&bot_ctx, &manager, &command).await,
+                "skip" => commands::skip::run(&bot_ctx, &manager, &command).await,
                 _ => {}
             }
         }

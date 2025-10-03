@@ -1,4 +1,4 @@
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serenity::futures::future::join_all;
 use thiserror::Error;
 use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, sync::Arc, vec};

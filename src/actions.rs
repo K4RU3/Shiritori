@@ -4,7 +4,7 @@ use serenity::all::{Context, Reaction, ReactionType};
 
 use crate::{
     arc_rwlock, bot_handler::Handler, message::{
-        generate_add_queue_message, generate_added_words_message, generate_find_message, generate_set_queue_message, TryMessageBuilder
+        generate_add_queue_message, generate_added_words_message, generate_find_message, generate_set_queue_message, generate_skip_message, TryMessageBuilder
     }, room::{RoomManager, VoteState}, util::get_word_mean_jp, MatchMode, SharedFuzzyIndex
 };
 
@@ -335,6 +335,29 @@ pub async fn find_words(ctx: &BotContext, manager: &RoomManager, word: &str, opt
             }
         }
     });
+}
+
+pub async fn skip(ctx: &BotContext, manager: &RoomManager, len: usize) {
+    let skipped: Option<u64>;
+    let queue: Vec<u64>;
+    {
+        let room_arc = manager.get_or_new_room_mut(ctx.room_id).await;
+        let mut room = room_arc.write().await;
+
+        skipped = room.user_queue.get(0).copied();
+
+        let size = room.user_queue.len();
+        if size > 0 {
+            room.user_queue.rotate_left(len % size);
+        }
+
+        room.vote_state = VoteState::default();
+
+        queue = room.user_queue.clone();
+    }
+
+    let message = generate_skip_message(queue, skipped, len);
+    (ctx.send)(message).await;
 }
 
 pub async fn reaction_changed(handler: &Handler, ctx: &Context, reaction: &Reaction, add: bool, bot_ctx: &BotContext) {
