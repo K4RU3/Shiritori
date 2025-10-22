@@ -1,1 +1,4 @@
-"# Empty main repository" 
+# Shiritori
+
+このプロジェクトでは、コミュニティで利用できる独自ルールのしりとり用Discord Botの開発を行います。
+
