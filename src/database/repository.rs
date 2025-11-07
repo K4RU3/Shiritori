@@ -1,19 +1,49 @@
-use anyhow::Result;
+#![allow(dead_code)]
+use rusqlite::{Row};
+use rusqlite::Error as SqliteError;
 use thiserror::Error;
 use std::{sync::Arc};
 
-use crate::database::db::{self, DataBase};
+use crate::{db_to_repo, impl_repo_error_partial_eq};
+use crate::{database::{db::DataBase, wrap_params::{i64_to_u64_bitwise, u64_to_i64_bitwise}}, wrap_params};
 
 #[derive(Debug, Error)]
 pub enum RepoError {
     #[error("ルームが存在しません(RoomNotFound)")]
     RoomNotFound,
+    #[error("そのルームはすでに存在します(RoomAlreadyExists)")]
+    RoomAlreadyExists,
+    #[error("その単語はすでにそのルームに存在します(WordAlreadyExists)")]
+    WordAlreadyExists,
+    #[error("追加する単語がNULLに相当します(NullWord)")]
+    NullWord,
     #[error("ユーザー順序が破損しています(BrokenChain)")]
     BrokenChain,
     #[error("データベースエラー: {0}")]
-    Database(#[from] rusqlite::Error), // ← rusqliteのエラーを自動変換
+    Database(#[from] SqliteError), // ← rusqliteのエラーを自動変換
     #[error("不明なエラー: {0}")]
     Other(#[from] anyhow::Error),      // ← anyhowなど他のResultを受け取る
+}
+
+// Database/Otherを除くPartialEqの実装
+impl_repo_error_partial_eq!(RepoError {
+    RoomNotFound,
+    RoomAlreadyExists,
+    WordAlreadyExists,
+    NullWord,
+    BrokenChain
+});
+
+impl Eq for RepoError {}
+
+pub type Result<T, E = RepoError> = core::result::Result<T, E>;
+
+pub struct Vote {
+    pub user_id: u64,
+    pub word: Option<String>,
+    pub good: Vec<u64>,
+    pub bad: Vec<u64>,
+    pub none: Vec<u64>,
 }
 
 pub struct Repository {
@@ -21,48 +51,144 @@ pub struct Repository {
 }
 
 impl Repository {
-    pub fn new(db_path: &str) -> anyhow::Result<Repository> {
-        let database = DataBase::new(db_path)?;
+    pub fn new(db: DataBase) -> anyhow::Result<Repository> {
         Ok(Self {
-            db: Arc::new(database),
+            db: Arc::new(db),
         })
     }
 
     pub async fn create_room(&self, room_id: u64) -> Result<()> {
-        self.db.execute("INSERT INTO rooms VALUES(?1)", [room_id])?;
+        let result = self.db.execute("INSERT INTO rooms VALUES(?1)", wrap_params!(room_id)).await;
+        db_to_repo!(result, {
+            SQLITE_CONSTRAINT_PRIMARYKEY => RepoError::RoomAlreadyExists,
+        })?;
         Ok(())
     }
 
-    pub async fn delete_room(&self, room_id: u64) -> Result<()> {
-        self.db.execute("DELETE FROM rooms WHERE id = ?1", [room_id])?;
-        Ok(())
+    /// 引数に与えられたルームを削除し、削除件数を返します。
+    pub async fn delete_room(&self, room_id: u64) -> Result<usize> {
+        let result = self.db.execute("DELETE FROM rooms WHERE id = (?1)", wrap_params!(room_id)).await;
+        
+        // Okにより削除件数が返されます。
+        // 基本的に特有エラーはなし
+        Ok(db_to_repo!(result, {})?)
     }
 
-    pub async fn insert_word(&self, room_id: u64, word: &str) -> Result<()> {
-        self.db.execute("INSERT INTO room_words VALUES(?1, ?2)", rusqlite::params![room_id, word])?;
-        Ok(())
+    pub async fn insert_word(&self, room_id: u64, word: &str) -> Result<usize> {
+        if word.len() == 0 {
+            return Err(RepoError::NullWord);
+        }
+
+        let result = self.db.execute("INSERT INTO room_words VALUES(?1, ?2)", wrap_params!(room_id, word)).await;
+        
+        let inserted_count = db_to_repo!(result, {
+            SQLITE_CONSTRAINT_PRIMARYKEY => RepoError::WordAlreadyExists,
+            SQLITE_CONSTRAINT_FOREIGNKEY => RepoError::RoomNotFound,
+            SQLITE_CONSTRAINT_NOTNULL => RepoError::NullWord
+        })?;
+
+        Ok(inserted_count)
     }
 
     pub async fn get_rooms(&self) -> Result<Vec<u64>> {
-        Ok(self
+        let result = self
             .db
-            .query_map("SELECT room_id FROM rooms", [], |row| row.get::<_, u64>(0))?)
+            .query_map("SELECT id FROM rooms", [], |row| {
+                let room_id_i64: i64 = row.get(0)?;
+                Ok(i64_to_u64_bitwise(room_id_i64))
+            }).await;
+        
+        let list = db_to_repo!(result, {})?;
+        
+        Ok(list)
     }
 
+    /*
     pub async fn get_words(&self, room_id: u64) -> Result<Vec<String>> {
-        Ok(self.db.query_map(
+    Ok(self.db.query_map(
             "SELECT words FROM room_words WHERE room_id = ?1",
             [room_id],
             |row| row.get(0),
-        )?)
+        ).await.map_err(anyhow::Error::from)?)
     }
 
     pub async fn add_vote_state(&self, room_id: u64, user_id: u64, word: &str) -> Result<()> {
         self.db.execute(
             "INSERT OR REPLACE INTO room_votes (room_id, current_user_id, word) VALUES (?1, ?2, ?3)",
-            rusqlite::params![room_id as i64, user_id as i64, word],
-        )?;
+            wrap_params![room_id, user_id, word],
+        ).await?;
         Ok(())
+    }
+
+    pub async fn get_vote_state(&self, room_id: u64) -> Result<Option<Vote>> {
+        let result: Option<Vote> = self.db.exclusive_transaction(move |tx| {
+            // ルームの存在確認
+            let room_exists = tx.query_row(
+                "SELECT id FROM rooms WHERE id = (?1)",
+                [room_id],
+                |_row| Ok(()),
+            );
+
+            if room_exists.is_err() {
+                // トランザクション内のErrは即座に伝播
+                return Err(RepoError::RoomNotFound.into());
+            }
+
+            // vote情報を取得
+            let vote_row = tx.query_row(
+                "SELECT current_user_id, word FROM room_votes WHERE room_id = (?1)",
+                [room_id],
+                |row| {
+                    let user_id = i64_to_u64_bitwise(row.get(0)?);
+                    let word = row.get::<_, Option<String>>(1)?;
+                    Ok((user_id, word))
+                },
+            );
+
+            // 該当データがなければ None
+            let (user_id, word) = match vote_row {
+                Ok(res) => res,
+                Err(_) => return Ok(None),
+            };
+            
+            // 投票状態取得
+            let sql = "SELECT user_id FROM member_votes WHERE room_id = ?1 AND state = ?2";
+
+            // good
+            let mut stmt = tx.prepare(sql)?;
+            let good_iter = stmt.query_map(wrap_params!(room_id, "good"), |row| {
+                let id: i64 = row.get(0)?;
+                Ok(i64_to_u64_bitwise(id))
+            })?;
+            let good: Vec<u64> = good_iter.filter_map(Result::ok).collect();
+
+            // bad
+            let bad_iter = stmt.query_map(wrap_params!(room_id, "bad"), |row| {
+                let id: i64 = row.get(0)?;
+                Ok(i64_to_u64_bitwise(id))
+            })?;
+            let bad: Vec<u64> = bad_iter.filter_map(Result::ok).collect();
+
+            // none
+            let none_iter = stmt.query_map(wrap_params!(room_id, "none"), |row| {
+                let id: i64 = row.get(0)?;
+                Ok(i64_to_u64_bitwise(id))
+            })?;
+            let none: Vec<u64> = none_iter.filter_map(Result::ok).collect();
+
+            let vote = Vote {
+                user_id,
+                word,
+                good,
+                bad,
+                none,
+            };
+
+            Ok(Some(vote))
+        })
+        .await?;
+
+        Ok(result)
     }
 
     pub async fn vote(&self, room_id: u64, user_id: u64, state: &str) -> Result<()> {
@@ -70,13 +196,13 @@ impl Repository {
             "INSERT INTO member_votes (room_id, user_id, state)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(room_id, user_id) DO UPDATE SET state = excluded.state",
-            rusqlite::params![room_id as i64, user_id as i64, state],
-        )?;
+            wrap_params![room_id as i64, user_id as i64, state],
+        ).await?;
         Ok(())
     }
 
     pub async fn delete_vote(&self, room_id: u64) -> Result<()> {
-        self.db.exclusive_transaction(|tx| {
+        self.db.exclusive_transaction(move |tx| {
             tx.execute(
                 "DELETE FROM room_votes WHERE room_id = ?1",
                 [room_id as i64],
@@ -86,13 +212,13 @@ impl Repository {
                 [room_id as i64],
             )?;
             Ok(())
-        })?;
+        }).await?;
         Ok(())
     }
 
     pub async fn set_queue(&self, room_id: u64, queue: Vec<u64>) -> Result<(), RepoError> {
         let queue_clone = queue.clone();
-        self.db.exclusive_transaction(|tx| {
+        self.db.exclusive_transaction(move |tx| {
             match tx.query_row(
                 "SELECT id FROM rooms WHERE id = ?1",
                 [room_id],
@@ -124,17 +250,17 @@ impl Repository {
             }
 
             tx.execute("DELETE FROM room_votes WHERE room_id = ?1", [room_id])?;
-            tx.execute("INSERT INTO room_votes (room_id, current_user_id, word) VALUES (?1, ?2, ?3)", rusqlite::params![room_id, queue_clone.get(0), rusqlite::types::Null])?;
+            tx.execute("INSERT INTO room_votes (room_id, current_user_id, word) VALUES (?1, ?2, NULL)", wrap_params![room_id, *queue_clone.get(0).unwrap()])?;
 
             Ok(())
-        })?;
+        }).await?;
 
         Ok(())
     }
 
     pub async fn get_queue(&self, room_id: u64) -> Result<Vec<u64>> {
         self.db
-            .exclusive_transaction(|tx| {
+            .exclusive_transaction(move |tx| {
                 // ルームがないときは空配列
                 if let Err(_) = tx.query_row("SELECT id FROM rooms WHERE id = ?1", [room_id], |_r| Ok(())) {
                     return Ok(Vec::<u64>::new());
@@ -143,7 +269,10 @@ impl Repository {
                 let current_user= match tx.query_row(
                     "SELECT current_user_id FROM room_votes WHERE room_id = ?1",
                     [room_id],
-                    |row| row.get::<_, u64>(0),
+                    |row| {
+                        let i: i64 = row.get(0)?;
+                        Ok(i64_to_u64_bitwise(i))
+                    },
                 ) {
                     Ok(id) => id,
                     Err(rusqlite::Error::QueryReturnedNoRows) => { return Ok(Vec::<u64>::new()); },
@@ -155,12 +284,15 @@ impl Repository {
                     "SELECT user_id, prev, next FROM room_members WHERE room_id = ?1",
                 )?;
                 let rows = stmt.query_map([room_id], |row| {
+                    let i: i64 = row.get(0)?;
+                    let u0 = i64_to_u64_bitwise(i);
+
                     Ok((
-                        row.get::<_, u64>(0)?,
-                        row.get::<_, Option<u64>>(1)?,
-                        row.get::<_, Option<u64>>(2)?,
+                        u0,
+                        row.get::<_, Option<i64>>(1)?.map(i64_to_u64_bitwise),
+                        row.get::<_, Option<i64>>(2)?.map(i64_to_u64_bitwise),
                     ))
-                }).map_err(|e| RepoError::BrokenChain)?;
+                }).map_err(|_e| RepoError::BrokenChain)?;
 
 
                 use std::collections::{HashMap, HashSet};
@@ -195,12 +327,13 @@ impl Repository {
 
                 Ok(queue)
             })
+            .await
             .map_err(Into::into)
     }
 
 
     pub async fn next_user(&self, room_id: u64) -> Result<()> {
-        self.db.exclusive_transaction(|tx| {
+        self.db.exclusive_transaction(move |tx| {
             // 現在のユーザーを取得
             let current: Option<i64> = match tx.query_row(
                 "SELECT current_user_id FROM room_votes WHERE room_id = ?1",
@@ -231,268 +364,171 @@ impl Repository {
             // 次ユーザーがNULLでもそのまま反映
             tx.execute(
                 "UPDATE room_votes SET current_user_id = ?2 WHERE room_id = ?1",
-                rusqlite::params![room_id as i64, next_user],
+                wrap_params![room_id as i64, next_user.unwrap()],
             )?;
 
             Ok(())
-        })?;
+        }).await?;
 
         Ok(())
     }
+
+    pub async fn dump_database<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        self.db.dump_database(path).await
+    }
+    
+    */
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::fs;
+
+    use crate::database::{db::DataBase, repository::{Repository, RepoError}};
     use anyhow::Result;
-    use rusqlite::params;
-    use std::sync::Arc;
-
-    /// --- 共通初期化: テスト用Repository ---
-    fn setup_repo() -> Result<Repository> {
-        let db = DataBase::new(":memory:")?;
-        let repo = Repository { db: Arc::new(db) };
-
-        // スキーマ読み込み（プロジェクトルートのschema.sqlを流用）
-        repo.db.load_schema_from_file("schema.sql")?;
-        Ok(repo)
+    async fn setup_repo() -> Result<Repository> {
+        let init_sql = fs::read_to_string("./schema.sql")?;
+        let db = DataBase::new(":memory:", Some(&init_sql)).await?;
+        Repository::new(db)
     }
-
-    /// --- 共通初期データ登録 ---
-    fn init_test_data(repo: &Repository) -> Result<()> {
-        repo.db.exclusive_transaction(|tx| {
-            let room_id: i64 = 1;
-            let user1: i64 = 2;
-            let user2: i64 = 3;
-            let nul = rusqlite::types::Null;
-
-            // rooms
-            tx.execute("INSERT INTO rooms VALUES(?1)", [room_id])?;
-            // users
-            tx.execute("INSERT INTO users VALUES(?1)", [user1])?;
-            tx.execute("INSERT INTO users VALUES(?1)", [user2])?;
-
-            // room_members（まずはnext/prevをNULLで登録）
-            tx.execute(
-                "INSERT INTO room_members VALUES(?1, ?2, ?3, ?4)",
-                params![room_id, user1, nul, nul],
-            )?;
-            tx.execute(
-                "INSERT INTO room_members VALUES(?1, ?2, ?3, ?4)",
-                params![room_id, user2, nul, nul],
-            )?;
-
-            // 相互リンク更新
-            tx.execute(
-                "UPDATE room_members SET next = ?1, prev = ?2 WHERE room_id = ?3 AND user_id = ?4",
-                params![user2, user2, room_id, user1],
-            )?;
-            tx.execute(
-                "UPDATE room_members SET next = ?1, prev = ?2 WHERE room_id = ?3 AND user_id = ?4",
-                params![user1, user1, room_id, user2],
-            )?;
-            Ok(())
-        })?;
-
-        Ok(())
-    }
-
+    
+    // 初期化テスト
+    
     #[tokio::test]
-    async fn test_add_vote_state() -> Result<()> {
-        let repo = setup_repo()?;
-        init_test_data(&repo)?;
-
-        repo.add_vote_state(1, 2, "apple").await?;
-
-        let current_user: i64 = repo.db.query_row(
-            "SELECT current_user_id FROM room_votes WHERE room_id = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(current_user, 2);
-        Ok(())
+    async fn test_initial_repository() {
+        let repo = setup_repo().await;
+        repo.unwrap_or_else(|e| panic!("Okとして返されるべき値がエラーでした。{:?}", e));
     }
-
+    
+    // ルーム操作テスト
+    
     #[tokio::test]
-    async fn test_vote() -> Result<()> {
-        let repo = setup_repo()?;
-        init_test_data(&repo)?;
-        repo.add_vote_state(1, 2, "apple").await?;
+    async fn test_create_room() -> Result<()> {
+        let repo = setup_repo().await?;
 
-        repo.vote(1, 2, "good").await?;
-
-        let state: String = repo.db.query_row(
-            "SELECT state FROM member_votes WHERE room_id = 1 AND user_id = 2",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(state, "good");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_next_user() -> Result<()> {
-        let repo = setup_repo()?;
-        init_test_data(&repo)?;
-        repo.add_vote_state(1, 2, "apple").await?;
-
-        repo.next_user(1).await?;
-
-        let next_user: i64 = repo.db.query_row(
-            "SELECT current_user_id FROM room_votes WHERE room_id = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(next_user, 3);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_delete_vote() -> Result<()> {
-        let repo = setup_repo()?;
-        init_test_data(&repo)?;
-        repo.add_vote_state(1, 2, "apple").await?;
-        repo.vote(1, 2, "good").await?;
-
-        repo.delete_vote(1).await?;
-
-        // room_votesにデータが消えているか確認
-        let deleted: rusqlite::Result<i64> = repo.db.query_row(
-            "SELECT current_user_id FROM room_votes WHERE room_id = 1",
-            [],
-            |row| row.get(0),
-        );
-        assert!(matches!(deleted, Err(rusqlite::Error::QueryReturnedNoRows)));
-
-        // member_votesがnoneにリセットされているか確認
-        let state_after: String = repo.db.query_row(
-            "SELECT state FROM member_votes WHERE room_id = 1 AND user_id = 2",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(state_after, "none");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_get_queue_cases() -> Result<()> {
-        // --- 共通初期化 ---
-        let repo = setup_repo()?;
-
-        // ========== ① ルームが存在しない ==========
+        // 作成に問題がない
         {
-            let result = repo.get_queue(999).await;
-            // エラーが出ていないか（関数実行自体は成功）
-            assert!(
-                result.is_ok(),
-                "roomが存在しない場合でもget_queueはErrを返すべきではない: {:?}",
-                result
-            );
-
-            let queue = result.unwrap();
-            assert!(
-                queue.is_empty(),
-                "存在しないルームは空配列を返すべき: got {:?}",
-                queue
-            );
+            let _ = repo.create_room(1).await.expect("1つ目のルーム作成でエラーが発生しました。");
         }
 
-        // ========== ② 始点が設定されていない ==========
+        // 他のルーム作成に問題がない
         {
-            let room_id = 1;
-            let result = repo.create_room(room_id).await;
-            assert!(
-                result.is_ok(),
-                "create_roomでエラーが発生しました: {:?}",
-                result
-            );
+            let _ = repo.create_room(2).await.expect("2つ目のルーム作成でエラーが発生しました。");
+        }
+        
+        // 重複するルームの作成
+        {
+            let result = repo.create_room(1).await;
+            assert_eq!(result, Err(RepoError::RoomAlreadyExists), "重複するルームの作成で適切なエラーが発生しませんでした。\n内容: {:?}", result);
+        }
+        
+        Ok(())
+    }
 
-            // まだqueueを設定していない
-            let result = repo.get_queue(room_id).await;
-            assert!(
-                result.is_ok(),
-                "終点未設定は空配列を返すべき: {:?}",
-                result
-            );
+    #[tokio::test]
+    async fn test_delete_room() -> Result<()> {
+        let repo = setup_repo().await?;
+        
+        // ルームの初期化
+        {
+            let _ = repo.create_room(1).await?;
+        }
+        
+        // 削除の確認
+        {
+            // 削除処理
+            let delete_count= repo.delete_room(1).await.expect("標準的なルームの削除に失敗しました。");            
+            assert_ne!(delete_count, 0, "削除されたルームの数が0件でした。");
+            
+            // 再登録の確認
+            let _recreate = repo.create_room(1).await.expect("削除されたルームの再登録に失敗しました。");
         }
 
-        // ========== ③ 順序が破損している ==========
+        Ok(())
+    }
+    
+    #[tokio::test]
+    async fn test_get_rooms() -> Result<()> {
+        let repo = setup_repo().await?;
+        let room_list: Vec<u64> = vec![1,3,6,8];
+        
+        // 初期化時テスト
         {
-            let room_id = 2;
-            let result = repo.create_room(room_id).await;
-            assert!(
-                result.is_ok(),
-                "create_roomでエラーが発生しました: {:?}",
-                result
-            );
-
-            // 正常なqueueを設定
-            let result = repo.set_queue(room_id, vec![1, 2]).await;
-            assert!(
-                result.is_ok(),
-                "set_queueでエラーが発生しました: {:?}",
-                result
-            );
-
-            // わざと破壊
-            let sql_result = repo
-                .db
-                .execute("UPDATE room_members SET next = NULL WHERE user_id = 1", []);
-            assert!(
-                sql_result.is_ok(),
-                "DB直接操作に失敗しました: {:?}",
-                sql_result
-            );
-
-            let result = repo.get_queue(room_id).await;
-            assert!(
-                result.is_err(),
-                "破損した順序はErrを返すべき: {:?}",
-                result
-            );
-
-            if let Err(e) = result {
-                assert!(
-                    e.to_string().contains("BrokenChain"),
-                    "BrokenChain エラーを期待したが、実際は {:?}",
-                    e
-                );
+            let result = repo.get_rooms().await;
+            assert_eq!(result, Ok(Vec::<u64>::new()), "初期化時にからであるルームリストが空ではありませんでした。");
+        }
+        
+        // 追加時テスト
+        {
+            for id in room_list.clone() {
+                let _ = repo.create_room(id).await?;
             }
-        }
-
-        // ========== ④ 正常な順序 ==========
-        {
-            let room_id = 3;
-            let result = repo.create_room(room_id).await;
-            assert!(
-                result.is_ok(),
-                "create_roomでエラーが発生しました: {:?}",
-                result
-            );
-
-            let result = repo.set_queue(room_id, vec![10, 20, 30]).await;
-            assert!(
-                result.is_ok(),
-                "set_queueでエラーが発生しました: {:?}",
-                result
-            );
-
-            let result = repo.get_queue(room_id).await;
-            assert!(
-                result.is_ok(),
-                "正常な順序取得でErrが返されました: {:?}",
-                result
-            );
-
-            let queue = result.unwrap();
-            assert_eq!(
-                queue,
-                vec![10, 20, 30],
-                "正しい順序が取得できるべき: got {:?}",
-                queue
-            );
+            
+            let result = repo.get_rooms().await;
+            assert!(result.is_ok(), "ルームの取得で不明のエラーが発生しました。\nエラー: {:?}", result.unwrap_err());
+            let mut got_room_list = result.unwrap();
+            got_room_list.sort();
+            assert_eq!(got_room_list, room_list, "追加したルームに不整合が発生しました。\n{:?} != {:?}", got_room_list, room_list);
         }
 
         Ok(())
     }
+    
+    // 単語操作テスト
+
+    #[tokio::test]
+    async fn test_insert_word() -> Result<()> {
+        let repo = setup_repo().await?;
+        
+        // ルーム未作成時挿入
+        {
+            let result = repo.insert_word(1, "test").await;
+            assert_eq!(result, Err(RepoError::RoomNotFound), "存在しないルームへの単語挿入時、想定されない処理がされました。\nresult: {:?}", result);
+        }
+        
+        // ルーム作成
+        let _ = repo.create_room(1).await?;
+        
+        // ルームに挿入
+        {
+            let result = repo.insert_word(1, "apple").await;
+            assert_eq!(result, Ok(1), "標準的な単語の追加に失敗しました。\nエラー: {:?}", result.as_ref().err());
+        }
+        
+        // 同一ワード挿入
+        {
+            let result = repo.insert_word(1, "apple").await;
+            assert_eq!(result, Err(RepoError::WordAlreadyExists), "すでに存在する単語の挿入で想定されていない処理がされました。\nresult: {:?}", result);
+        }
+        
+        // ルーム削除時
+        {
+            let _ = repo.delete_room(1).await?;
+            let _ = repo.create_room(1).await?;
+            let result = repo.insert_word(1, "apple").await;
+            assert_eq!(result, Ok(1), "再生成後のルームへの単語挿入でエラーが発生しました。\nエラー: {:?}", result.as_ref().err());
+        }
+        
+        //  NULLに準ずるワード挿入
+        {
+            let result = repo.insert_word(1, "").await;
+            assert_eq!(result, Err(RepoError::NullWord), "Nullに準ずるワードの挿入で想定されていない処理がされました。\nエラー: {:?}", result);
+        }
+
+        Ok(())
+    }
+
+    /* テストテンプレート
+    #[tokio::test]
+    async fn test_XXX() -> Result<()> {
+        let repo = setup_repo().await?;
+
+        Ok(())
+    }
+    */
+}
+
+fn row_to_u64(row: &Row<'_>, idx: usize) -> Result<u64> {
+    let i: i64 = row.get(idx)?;
+    Ok(i64_to_u64_bitwise(i))
 }

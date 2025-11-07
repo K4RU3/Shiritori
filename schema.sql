@@ -35,6 +35,17 @@ CREATE TABLE member_votes (
     PRIMARY KEY (room_id, user_id)
 );
 
+-- 投票変更時自動削除
+CREATE TRIGGER clear_member_votes_on_room_vote_change
+AFTER UPDATE OF current_user_id, word ON room_votes
+FOR EACH ROW
+WHEN OLD.current_user_id != NEW.current_user_id
+   OR OLD.word IS NOT NEW.word
+BEGIN
+    DELETE FROM member_votes
+    WHERE room_id = NEW.room_id;
+END;
+
 -- 使われた単語リスト（履歴）
 CREATE TABLE room_words (
     room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,

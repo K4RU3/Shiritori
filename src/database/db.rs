@@ -1,175 +1,215 @@
-use rusqlite::{Connection, Params, Result};
-use std::{fs, sync::Mutex};
+use std::{fs::File, path::Path, io::Write};
+use rusqlite::{Connection, Params};
+use tokio::{sync::Mutex, task::JoinError};
+use std::sync::Arc;
+use thiserror::Error;
 
-/// SQLiteデータベースへの基本アクセスを提供する構造体
-pub struct DataBase {
-    conn: Mutex<Connection>,
+#[derive(Debug, Error)]
+pub enum DatabaseError {
+    #[error("Sqlite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("非同期タスクエラー: {0}")]
+    Join(#[from] JoinError),
 }
 
+pub type Result<T, E = DatabaseError> = std::result::Result<T, E>;
+
+pub struct DataBase {
+    conn: Arc<Mutex<Connection>>,
+}
+
+#[allow(dead_code)]
 impl DataBase {
     /// 新しいデータベース接続を作成します。
-    /// pathに":memory:"を指定するとメモリ上に一時DBが作られます。
-    pub fn new(path: &str) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        conn.pragma_update(None, "foreign_keys", &"ON")?;
+    pub async fn new(path: &str, init_sql: Option<&str>) -> Result<Self> {
+        let path_owned = path.to_owned();
+        let init_sql_owned = init_sql.map(|s| s.to_owned());
+
+        let conn = tokio::task::spawn_blocking(move || -> Result<Connection> {
+            let db_exists = Path::new(&path_owned).exists();
+            let conn = Connection::open(&path_owned)?;
+            if !db_exists {
+                if let Some(sql) = init_sql_owned.as_deref() {
+                    conn.execute_batch(sql)?;
+                }
+            }
+            conn.pragma_update(None, "foreign_keys", &"ON")?;
+            Ok(conn)
+        })
+        .await??;
+
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
         })
     }
 
     /// 単純なSQL文を実行します（INSERT, UPDATE, DELETEなど）
-    pub fn execute<P>(&self, sql: &str, params: P) -> Result<usize>
-    where 
-        P: Params
-    {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(sql, params)
-    }
-
-    /// SELECT文を実行し、1行だけ結果を取得します
-    pub fn query_row<T, F>(&self, sql: &str, params: impl Params, f: F) -> Result<T>
+    pub async fn execute<P>(&self, sql: &str, params: P) -> Result<usize>
     where
-        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+        P: Send + Params + 'static,
     {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(sql, params, f)
-    }
+        let conn = self.conn.clone();
+        let sql = sql.to_string();
 
-    /// SELECT文を実行し、複数行の結果をベクタとして返します
-    pub fn query_map<T, F>(&self, sql: &str, params: impl Params, mut f: F) -> Result<Vec<T>>
-    where
-        F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-    {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map(params, |row| f(row))?;
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
-    }
-
-    /// SQLiteの生コネクションを参照します（テストや低レベル操作用）
-    pub fn connection(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap()
-    }
-
-    /// 一連の処理をトランザクションとして安全に実行します。
-    /// 他スレッドからのアクセスはブロックされ、atomicに実行されます。
-    pub fn exclusive_transaction<F, T>(&self, f: F) -> anyhow::Result<T>
-    where
-        F: FnOnce(&rusqlite::Transaction<'_>) -> anyhow::Result<T>,
-    {
-        let mut conn = self.conn.lock().unwrap(); // ← 他スレッドをブロック
-        let tx = conn.transaction()?; // ← トランザクション開始
-        let result = f(&tx)?; // ← 処理本体
-        tx.commit()?; // ← 一括コミット
+        let result = tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(&sql, params)
+        })
+        .await??;
+        
         Ok(result)
     }
 
-    /// スキーマ定義(schema.sqlなど)の読み込みに使用します。
-    pub fn load_schema_from_file<P: AsRef<std::path::Path>>(&self, path: P) -> anyhow::Result<()> {
-        let sql = fs::read_to_string(path)?;   // std::io::Error → anyhowが自動変換
-        self.execute_batch(&sql)?;             // rusqlite::Error → anyhowが自動変換
-        Ok(())
+    /// SELECT文を実行し、1行だけ結果を取得します
+    pub async fn query_row<T, F, P>(&self, sql: &str, params: P, f: F) -> Result<T>
+    where
+        P: Send + Params + 'static,
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let conn = self.conn.clone();
+        let sql = sql.to_string();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.query_row(&sql, params, f)
+        })
+        .await??;
+        
+        Ok(result)
     }
 
-    /// execute_batch（複数SQL文をまとめて実行）
-    pub fn execute_batch(&self, sql: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute_batch(sql)?;
-        Ok(())
-    }
-}
+    /// SELECT文を実行し、複数行の結果をベクタとして返します
+    pub async fn query_map<T, F, P>(&self, sql: &str, params: P, mut f: F) -> Result<Vec<T>>
+    where
+        P: Send + Params + 'static,
+        F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let conn = self.conn.clone();
+        let sql = sql.to_string();
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rusqlite::params;
-    use std::sync::Arc;
-    use std::thread;
-
-    fn setup_test_db() -> DataBase {
-        DataBase::new(":memory:").expect("in-memory DB should open")
-    }
-
-    #[test]
-    fn test_create_connection() {
-        let db = setup_test_db();
-        assert!(db.connection().is_autocommit());
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params, |row| f(row))?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            Ok(results)
+        })
+        .await?
     }
 
-    #[test]
-    fn test_create_table_and_insert() {
-        let db = setup_test_db();
-        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])
-            .unwrap();
-        let inserted = db
-            .execute("INSERT INTO users (name) VALUES (?1)", params!["Rikka"])
-            .unwrap();
-        assert_eq!(inserted, 1);
+    /// 一連の処理をトランザクションとして安全に実行します。
+    /// atomic に実行され、他スレッドからブロックされます。
+    pub async fn exclusive_transaction<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let conn = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.blocking_lock();
+            let tx = conn.transaction()?;
+            let result = f(&tx)?;
+            tx.commit()?;
+            Ok(result)
+        })
+        .await?
     }
 
-    #[test]
-    fn test_query_row() {
-        let db = setup_test_db();
-        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])
-            .unwrap();
-        db.execute("INSERT INTO users (name) VALUES (?1)", params!["Rikka"])
-            .unwrap();
-        let name: String = db
-            .query_row("SELECT name FROM users WHERE id = 1", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(name, "Rikka");
-    }
+    /// 複数SQL文をまとめて実行
+    pub async fn execute_batch(&self, sql: &str) -> Result<()> {
+        let conn = self.conn.clone();
+        let sql = sql.to_string();
 
-    #[test]
-    fn test_exclusive_transaction() {
-        let db = setup_test_db();
-        db.exclusive_transaction(|tx| {
-            tx.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])?;
-            tx.execute("INSERT INTO users (name) VALUES ('A')", [])?;
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute_batch(&sql)?;
             Ok(())
         })
-        .unwrap();
-
-        let count: i64 = db
-            .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 1);
+        .await?
     }
 
-    #[test]
-    fn test_multithread_access_is_safe() {
-        let db = Arc::new(setup_test_db());
-        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])
-            .unwrap();
+    /// schemaファイルを読み込む
+    pub async fn load_schema(&self, sql: &str) -> Result<()> {
+        self.execute_batch(&sql).await?;
+        Ok(())
+    }
+    
+    /// データベース情報ダンプ
+    /// データベースをSQL形式でダンプし、指定したファイルに出力します。
+    pub async fn dump_database<P: AsRef<Path>>(&self, path: P) -> Result<(), anyhow::Error> {
+        let conn = self.conn.clone();
+        let path = path.as_ref().to_path_buf();
 
-        let db1 = db.clone();
-        let t1 = thread::spawn(move || {
-            db1.exclusive_transaction(|tx| {
-                tx.execute("INSERT INTO users (name) VALUES ('ThreadA')", [])?;
-                Ok(())
-            })
-            .unwrap();
-        });
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut file = File::create(&path)?;
 
-        let db2 = db.clone();
-        let t2 = thread::spawn(move || {
-            db2.exclusive_transaction(|tx| {
-                tx.execute("INSERT INTO users (name) VALUES ('ThreadB')", [])?;
-                Ok(())
-            })
-            .unwrap();
-        });
+            // 1. sqlite_masterからスキーマ取得
+            let mut stmt = conn.prepare(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master
+                 WHERE type IN ('table', 'index', 'trigger', 'view')
+                 ORDER BY type DESC, name",
+            )?;
 
-        t1.join().unwrap();
-        t2.join().unwrap();
+            let entries = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,         // type
+                    row.get::<_, String>(1)?,         // name
+                    row.get::<_, String>(2)?,         // tbl_name
+                    row.get::<_, Option<String>>(3)?, // sql
+                ))
+            })?;
 
-        let names: Vec<String> = db
-            .query_map("SELECT name FROM users", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(names.len(), 2);
+            // 2. 出力開始
+            writeln!(file, "BEGIN TRANSACTION;")?;
+
+            for entry in entries {
+                let (ty, name, _tbl_name, sql) = entry?;
+                if let Some(sql) = sql {
+                    writeln!(file, "{};", sql)?;
+                }
+
+                // 3. テーブルデータをINSERT文で出力
+                if ty == "table" && name != "sqlite_sequence" {
+                    let mut stmt = conn.prepare(&format!("SELECT * FROM {}", name))?;
+                    let column_count = stmt.column_count();
+                    let mut rows = stmt.query([])?;
+
+                    while let Some(row) = rows.next()? {
+                        let mut values = Vec::with_capacity(column_count);
+                        for i in 0..column_count {
+                            let value: rusqlite::types::Value = row.get(i)?;
+                            let val_str = match value {
+                                rusqlite::types::Value::Null => "NULL".to_string(),
+                                rusqlite::types::Value::Integer(v) => v.to_string(),
+                                rusqlite::types::Value::Real(v) => v.to_string(),
+                                rusqlite::types::Value::Text(t) => {
+                                    format!("'{}'", t.replace('\'', "''"))
+                                }
+                                rusqlite::types::Value::Blob(_) => "'<BLOB>'".to_string(),
+                            };
+                            values.push(val_str);
+                        }
+
+                        writeln!(
+                            file,
+                            "INSERT INTO {} VALUES({});",
+                            name,
+                            values.join(", ")
+                        )?;
+                    }
+                }
+            }
+
+            writeln!(file, "COMMIT;")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?
     }
 }

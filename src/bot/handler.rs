@@ -1,6 +1,12 @@
-use serenity::{all::{Context, EventHandler, Ready}, async_trait};
+use std::sync::Arc;
 
-pub struct Handler;
+use serenity::{all::{Context, EventHandler, Ready}, async_trait};
+use crate::bot::bot_context::BotContext;
+
+#[allow(dead_code)]
+pub struct Handler {
+    pub ctx: Arc<BotContext>,
+}
 
 #[async_trait]
 impl EventHandler for Handler {
