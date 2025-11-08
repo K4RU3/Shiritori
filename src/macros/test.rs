@@ -1,3 +1,7 @@
+use std::fmt::Debug;
+
+use crate::database::repository::RepoError;
+
 #[macro_export]
 macro_rules! assert_with_fail {
     // メッセージあり
@@ -33,4 +37,26 @@ macro_rules! assert_with_fail {
             panic!("assert_with_fail! failed: {}", stringify!($cond));
         }
     }};
+}
+
+#[macro_export]
+macro_rules! assert_or_ok {
+    ($res:expr, $msg:expr $(, $($arg:tt)+)?) => {{
+        match &$res {
+            Ok(_) => (),
+            Err(e) => panic!(
+                concat!($msg, "\nエラー内容: {:?}"),
+                $($($arg)+,)? e
+            ),
+        }
+    }};
+}
+
+pub fn assert_room_not_found<T: Debug + PartialEq + Eq>(result: Result<T, RepoError>) {
+    assert_eq!(
+        result,
+        Err(RepoError::RoomNotFound),
+        "存在しないルームへの操作で想定外の結果: {:?}",
+        result
+    );
 }

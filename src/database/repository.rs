@@ -1,11 +1,17 @@
 #![allow(dead_code)]
-use rusqlite::{Row};
 use rusqlite::Error as SqliteError;
+use rusqlite::Row;
+use std::sync::Arc;
 use thiserror::Error;
-use std::{sync::Arc};
 
+use crate::{
+    database::{
+        db::DataBase,
+        wrap_params::{i64_to_u64_bitwise, u64_to_i64_bitwise},
+    },
+    wrap_params,
+};
 use crate::{db_to_repo, impl_repo_error_partial_eq};
-use crate::{database::{db::DataBase, wrap_params::{i64_to_u64_bitwise, u64_to_i64_bitwise}}, wrap_params};
 
 #[derive(Debug, Error)]
 pub enum RepoError {
@@ -22,7 +28,7 @@ pub enum RepoError {
     #[error("データベースエラー: {0}")]
     Database(#[from] SqliteError), // ← rusqliteのエラーを自動変換
     #[error("不明なエラー: {0}")]
-    Other(#[from] anyhow::Error),      // ← anyhowなど他のResultを受け取る
+    Other(#[from] anyhow::Error), // ← anyhowなど他のResultを受け取る
 }
 
 // Database/Otherを除くPartialEqの実装
@@ -46,19 +52,21 @@ pub struct Vote {
     pub none: Vec<u64>,
 }
 
+#[derive(Clone)]
 pub struct Repository {
     db: Arc<DataBase>,
 }
 
 impl Repository {
     pub fn new(db: DataBase) -> anyhow::Result<Repository> {
-        Ok(Self {
-            db: Arc::new(db),
-        })
+        Ok(Self { db: Arc::new(db) })
     }
 
     pub async fn create_room(&self, room_id: u64) -> Result<()> {
-        let result = self.db.execute("INSERT INTO rooms VALUES(?1)", wrap_params!(room_id)).await;
+        let result = self
+            .db
+            .execute("INSERT INTO rooms VALUES(?1)", wrap_params!(room_id))
+            .await;
         db_to_repo!(result, {
             SQLITE_CONSTRAINT_PRIMARYKEY => RepoError::RoomAlreadyExists,
         })?;
@@ -67,8 +75,11 @@ impl Repository {
 
     /// 引数に与えられたルームを削除し、削除件数を返します。
     pub async fn delete_room(&self, room_id: u64) -> Result<usize> {
-        let result = self.db.execute("DELETE FROM rooms WHERE id = (?1)", wrap_params!(room_id)).await;
-        
+        let result = self
+            .db
+            .execute("DELETE FROM rooms WHERE id = (?1)", wrap_params!(room_id))
+            .await;
+
         // Okにより削除件数が返されます。
         // 基本的に特有エラーはなし
         Ok(db_to_repo!(result, {})?)
@@ -79,8 +90,14 @@ impl Repository {
             return Err(RepoError::NullWord);
         }
 
-        let result = self.db.execute("INSERT INTO room_words VALUES(?1, ?2)", wrap_params!(room_id, word)).await;
-        
+        let result = self
+            .db
+            .execute(
+                "INSERT INTO room_words VALUES(?1, ?2)",
+                wrap_params!(room_id, word),
+            )
+            .await;
+
         let inserted_count = db_to_repo!(result, {
             SQLITE_CONSTRAINT_PRIMARYKEY => RepoError::WordAlreadyExists,
             SQLITE_CONSTRAINT_FOREIGNKEY => RepoError::RoomNotFound,
@@ -96,7 +113,32 @@ impl Repository {
             .query_map("SELECT id FROM rooms", [], |row| {
                 let room_id_i64: i64 = row.get(0)?;
                 Ok(i64_to_u64_bitwise(room_id_i64))
-            }).await;
+            })
+            .await;
+
+        let list = db_to_repo!(result, {})?;
+
+        Ok(list)
+    }
+
+    pub async fn get_words(&self, room_id: u64) -> Result<Vec<String>> {
+        let room_result = self.db.query_row("SELECT id FROM rooms WHERE id = ?1", wrap_params!(room_id), |f|f.get::<_,i64>(0)).await;
+        if room_result.is_err() {
+            return Err(RepoError::RoomNotFound);
+        }
+
+        let result = self
+            .db
+            .query_map(
+                "SELECT word FROM room_words WHERE room_id = ?1",
+                wrap_params!(room_id),
+                |row| {
+                    let str = row.get::<_, String>(0)?;
+                    
+                    Ok(str)
+                },
+            )
+            .await;
         
         let list = db_to_repo!(result, {})?;
         
@@ -104,14 +146,6 @@ impl Repository {
     }
 
     /*
-    pub async fn get_words(&self, room_id: u64) -> Result<Vec<String>> {
-    Ok(self.db.query_map(
-            "SELECT words FROM room_words WHERE room_id = ?1",
-            [room_id],
-            |row| row.get(0),
-        ).await.map_err(anyhow::Error::from)?)
-    }
-
     pub async fn add_vote_state(&self, room_id: u64, user_id: u64, word: &str) -> Result<()> {
         self.db.execute(
             "INSERT OR REPLACE INTO room_votes (room_id, current_user_id, word) VALUES (?1, ?2, ?3)",
@@ -150,7 +184,7 @@ impl Repository {
                 Ok(res) => res,
                 Err(_) => return Ok(None),
             };
-            
+
             // 投票状態取得
             let sql = "SELECT user_id FROM member_votes WHERE room_id = ?1 AND state = ?2";
 
@@ -376,157 +410,316 @@ impl Repository {
     pub async fn dump_database<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         self.db.dump_database(path).await
     }
-    
+
     */
 }
+
+
 
 #[cfg(test)]
 mod tests {
     use std::fs;
 
-    use crate::database::{db::DataBase, repository::{Repository, RepoError}};
+    use crate::{assert_or_ok, database::{
+        db::DataBase,
+        repository::{RepoError, Repository},
+    }};
     use anyhow::Result;
+
+    struct TestGuard<'a> {
+        repo: &'a Repository,
+        dumppath: String
+    }
+
+
+    impl<'a> Drop for TestGuard<'a> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                eprintln!("Test failed — dumping database...");
+
+                // dumpパスと参照をクローン（スレッドにmoveできるように）
+                let dumppath = self.dumppath.clone();
+                // repoはDrop中にmoveできないので、Arcなどで共有できるようにしておく必要あり
+                let repo = (*self.repo).clone();
+
+                // 別スレッドで非同期ダンプ実行
+                std::thread::spawn(move || {
+                    // このスレッド専用のRuntimeを作る（既存Tokioとは独立）
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("failed to build runtime for dump");
+
+                    // 非同期関数をブロッキングで実行
+                    rt.block_on(async move {
+                        if let Err(e) = repo.db.dump_database(&dumppath).await {
+                            eprintln!("Failed to dump database: {:?}", e);
+                        } else {
+                            eprintln!("Database dumped successfully to {}", dumppath);
+
+                            // sqlite3コマンドで .sqlite に復元
+                            let sqlite_path = format!("{}.sqlite", dumppath.trim_end_matches(".dump"));
+                            let status = std::process::Command::new("sqlite3")
+                                .arg(&sqlite_path)                     // 生成するDBファイル
+                                .arg(format!(".read {}", dumppath))    // 読み込むSQLダンプ
+                                .status();
+
+                            match status {
+                                Ok(s) if s.success() => {
+                                    eprintln!("Database file created successfully: {}", dumppath);
+                                }
+                                Ok(s) => {
+                                    eprintln!(
+                                        "sqlite3 exited with non-zero status: {} (dump at {})",
+                                        s, dumppath
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to invoke sqlite3: {:?} (dump at {})", e, dumppath);
+                                }
+                            }
+                        }
+                    });
+                });
+            }
+        }
+    }
+    
+    // セットアップ
     async fn setup_repo() -> Result<Repository> {
         let init_sql = fs::read_to_string("./schema.sql")?;
         let db = DataBase::new(":memory:", Some(&init_sql)).await?;
         Repository::new(db)
     }
     
-    // 初期化テスト
-    
-    #[tokio::test]
-    async fn test_initial_repository() {
-        let repo = setup_repo().await;
-        repo.unwrap_or_else(|e| panic!("Okとして返されるべき値がエラーでした。{:?}", e));
+    async fn setup_create_rooms(repo: &Repository, rooms: &Vec<u64>) {
+        for id in rooms {
+            repo.create_room(*id)
+                .await
+                .unwrap_or_else(|e| panic!("テスト対象外のcreate_roomでエラーが発生しました。\nエラー: {:?}", e));
+        }
     }
     
+    async fn setup_insert_words(repo: &Repository, room_id: u64, words: &Vec<&str>) {
+        for word in words {
+            repo.insert_word(room_id, word)
+                .await
+                .unwrap_or_else(|e| panic!("テスト対象外のinsert_wordでエラーが発生しました。\nエラー: {:?}", e));
+        }
+    }
+
+    // 初期化テスト
+
+    #[tokio::test]
+    async fn test_initial_repository() -> Result<()> {
+        let repo = setup_repo().await;
+        assert_or_ok!(repo, "単純なRepositoryの初期化でエラーが発生しました。");
+        
+        Ok(())
+    }
+
+
     // ルーム操作テスト
-    
+
     #[tokio::test]
     async fn test_create_room() -> Result<()> {
         let repo = setup_repo().await?;
 
         // 作成に問題がない
         {
-            let _ = repo.create_room(1).await.expect("1つ目のルーム作成でエラーが発生しました。");
+            let result = repo
+                .create_room(1)
+                .await;
+            assert_or_ok!(result, "1つ目のルーム作成時にエラーが発生しました。");
         }
 
         // 他のルーム作成に問題がない
         {
-            let _ = repo.create_room(2).await.expect("2つ目のルーム作成でエラーが発生しました。");
+            let result = repo
+                .create_room(2)
+                .await;
+            assert_or_ok!(result, "2つ目のルーム作成時にエラーが発生しました。");
         }
-        
+
         // 重複するルームの作成
         {
             let result = repo.create_room(1).await;
-            assert_eq!(result, Err(RepoError::RoomAlreadyExists), "重複するルームの作成で適切なエラーが発生しませんでした。\n内容: {:?}", result);
+            assert_eq!(
+                result,
+                Err(RepoError::RoomAlreadyExists),
+                "重複するルームの作成で適切なエラーが発生しませんでした。\n内容: {:?}",
+                result
+            );
         }
-        
+
         Ok(())
     }
 
     #[tokio::test]
     async fn test_delete_room() -> Result<()> {
         let repo = setup_repo().await?;
-        
-        // ルームの初期化
-        {
-            let _ = repo.create_room(1).await?;
-        }
-        
+        let _ = setup_create_rooms(&repo, &vec![1]).await;
+
         // 削除の確認
         {
             // 削除処理
-            let delete_count= repo.delete_room(1).await.expect("標準的なルームの削除に失敗しました。");            
+            let delete_count = repo
+                .delete_room(1)
+                .await
+                .unwrap_or_else(|e| panic!("適切なルームの削除でエラーが発生しました。\nエラー: {:?}", e));
             assert_ne!(delete_count, 0, "削除されたルームの数が0件でした。");
-            
+
             // 再登録の確認
-            let _recreate = repo.create_room(1).await.expect("削除されたルームの再登録に失敗しました。");
+            let recreate = repo
+                .create_room(1)
+                .await;
+            assert_or_ok!(recreate, "ルームの削除後の作成に失敗しました。");
         }
 
         Ok(())
     }
-    
+
     #[tokio::test]
     async fn test_get_rooms() -> Result<()> {
         let repo = setup_repo().await?;
-        let room_list: Vec<u64> = vec![1,3,6,8];
-        
+        let room_list: Vec<u64> = vec![1, 3, 6, 8]; // ソート前提
+
         // 初期化時テスト
         {
             let result = repo.get_rooms().await;
-            assert_eq!(result, Ok(Vec::<u64>::new()), "初期化時にからであるルームリストが空ではありませんでした。");
+            assert_eq!(
+                result,
+                Ok(Vec::<u64>::new()),
+                "初期化時に空であるルームリストが空ではありませんでした。"
+            );
         }
         
+        setup_create_rooms(&repo, &room_list).await; // ルーム追加
+
         // 追加時テスト
         {
-            for id in room_list.clone() {
-                let _ = repo.create_room(id).await?;
-            }
-            
             let result = repo.get_rooms().await;
-            assert!(result.is_ok(), "ルームの取得で不明のエラーが発生しました。\nエラー: {:?}", result.unwrap_err());
+            assert!(
+                result.is_ok(),
+                "ルームの取得で不明のエラーが発生しました。\nエラー: {:?}",
+                result.unwrap_err()
+            );
             let mut got_room_list = result.unwrap();
             got_room_list.sort();
-            assert_eq!(got_room_list, room_list, "追加したルームに不整合が発生しました。\n{:?} != {:?}", got_room_list, room_list);
+            assert_eq!(
+                got_room_list, room_list,
+                "追加したルームに不整合が発生しました。\n{:?} != {:?}",
+                got_room_list, room_list
+            );
         }
 
         Ok(())
     }
-    
+
     // 単語操作テスト
 
     #[tokio::test]
     async fn test_insert_word() -> Result<()> {
         let repo = setup_repo().await?;
-        
+
         // ルーム未作成時挿入
         {
             let result = repo.insert_word(1, "test").await;
-            assert_eq!(result, Err(RepoError::RoomNotFound), "存在しないルームへの単語挿入時、想定されない処理がされました。\nresult: {:?}", result);
+            assert_eq!(
+                result,
+                Err(RepoError::RoomNotFound),
+                "存在しないルームへの単語挿入時、想定されない処理がされました。\nresult: {:?}",
+                result
+            );
         }
-        
-        // ルーム作成
-        let _ = repo.create_room(1).await?;
-        
+
+        setup_create_rooms(&repo, &vec![1]).await;
+
         // ルームに挿入
         {
             let result = repo.insert_word(1, "apple").await;
-            assert_eq!(result, Ok(1), "標準的な単語の追加に失敗しました。\nエラー: {:?}", result.as_ref().err());
+            assert_eq!(
+                result,
+                Ok(1),
+                "標準的な単語の追加に失敗しました。\nエラー: {:?}",
+                result.as_ref().err()
+            );
         }
-        
+
         // 同一ワード挿入
         {
             let result = repo.insert_word(1, "apple").await;
-            assert_eq!(result, Err(RepoError::WordAlreadyExists), "すでに存在する単語の挿入で想定されていない処理がされました。\nresult: {:?}", result);
+            assert_eq!(
+                result,
+                Err(RepoError::WordAlreadyExists),
+                "すでに存在する単語の挿入で想定されていない処理がされました。\nresult: {:?}",
+                result
+            );
         }
-        
+
         // ルーム削除時
         {
             let _ = repo.delete_room(1).await?;
             let _ = repo.create_room(1).await?;
             let result = repo.insert_word(1, "apple").await;
-            assert_eq!(result, Ok(1), "再生成後のルームへの単語挿入でエラーが発生しました。\nエラー: {:?}", result.as_ref().err());
+            assert_eq!(
+                result,
+                Ok(1),
+                "再生成後のルームへの単語挿入でエラーが発生しました。\nエラー: {:?}",
+                result.as_ref().err()
+            );
         }
-        
+
         //  NULLに準ずるワード挿入
         {
             let result = repo.insert_word(1, "").await;
-            assert_eq!(result, Err(RepoError::NullWord), "Nullに準ずるワードの挿入で想定されていない処理がされました。\nエラー: {:?}", result);
+            assert_eq!(
+                result,
+                Err(RepoError::NullWord),
+                "Nullに準ずるワードの挿入で想定されていない処理がされました。\nエラー: {:?}",
+                result
+            );
         }
 
         Ok(())
     }
-
-    /* テストテンプレート
+    
     #[tokio::test]
-    async fn test_XXX() -> Result<()> {
+    async fn test_get_words() -> Result<()> {
         let repo = setup_repo().await?;
+        let word_list: Vec<&str> = vec!["apple", "banana", "god"];
+        
+        // ルーム未作成時テスト
+        {
+            let result = repo.get_words(1).await;
+            assert_eq!(result, Err(RepoError::RoomNotFound), "未作成のルームからの単語取得で、想定されていない処理がされました。\nresult: {:?}", result.as_ref())
+        }
+        
+        setup_create_rooms(&repo, &vec![1]).await;
+        
+        // 作成後空取得テスト
+        {
+            let result = repo.get_words(1).await;
+            assert_eq!(result, Ok(Vec::<String>::new()), "単語情報のないルームからの単語取得において、空の配列が返りませんでした。\nresult: {:?}", result.as_ref());
+        }
+        
+        setup_insert_words(&repo, 1, &word_list).await;
+        
+        // 単語挿入後テスト
+        {
+            let result = repo.get_words(1).await;
+            assert_or_ok!(result, "正常な単語軍の取得でエラーが発生しました。");
+            let mut original = word_list.clone();
+            let mut target = result.unwrap();
+            original.sort();
+            target.sort();
+            assert_eq!(original, target, "挿入した単語群と取得した単語群が異なります。\noriginal: {:?}\ntarget: {:?}", original, target);
+        }
 
         Ok(())
     }
-    */
 }
+
 
 fn row_to_u64(row: &Row<'_>, idx: usize) -> Result<u64> {
     let i: i64 = row.get(idx)?;
