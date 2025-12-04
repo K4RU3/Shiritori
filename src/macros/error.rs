@@ -9,24 +9,19 @@ macro_rules! db_to_repo {
         use crate::database::repository::RepoError;
 
         match $expr {
-            Ok(val) => Ok(val),
+            Ok(val) => Ok::<_, RepoError>(val),
             Err(e) => match e {
-                DatabaseError::Sqlite(sql_err) => {
-                    // rusqlite::Error::SqliteFailure を取り出す
-                    if let SqliteError::SqliteFailure(ref ffi_err, _) = sql_err {
+                DatabaseError::Sqlite(sql_err) => match sql_err {
+                    SqliteError::SqliteFailure(ref ffi_err, _) => {
                         match ffi_err.extended_code {
                             $(
-                                code if code == ffi::$sqlite_code as i32 => {
-                                    return Err($repo_variant);
-                                }
+                                code if code == ffi::$sqlite_code as i32 => Err($repo_variant),
                             )*
-                            // 該当しないSQLiteエラー
-                            _ => return Err(RepoError::Database(sql_err)),
+                            _ => Err(RepoError::Database(sql_err)),
                         }
                     }
-                    // SQLiteFailure以外のrusqliteエラー
-                    Err(RepoError::Database(sql_err))
-                }
+                    _ => Err(RepoError::Database(sql_err)),
+                },
                 DatabaseError::Join(join_err) => {
                     Err(RepoError::Other(anyhow::anyhow!(join_err)))
                 }

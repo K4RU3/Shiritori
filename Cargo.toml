@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
+chrono = "0.4.42"
 dotenv = "0.15.0"
 futures = "0.3.31"
 rusqlite = { version = "0.37.0", features = ["bundled"] }

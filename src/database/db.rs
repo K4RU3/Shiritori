@@ -1,8 +1,8 @@
-use std::{fs::File, path::Path, io::Write};
 use rusqlite::{Connection, Params};
-use tokio::{sync::Mutex, task::JoinError};
 use std::sync::Arc;
+use std::{fs::File, io::Write, path::Path};
 use thiserror::Error;
+use tokio::{sync::Mutex, task::JoinError};
 
 #[derive(Debug, Error)]
 pub enum DatabaseError {
@@ -16,6 +16,81 @@ pub type Result<T, E = DatabaseError> = std::result::Result<T, E>;
 
 pub struct DataBase {
     conn: Arc<Mutex<Connection>>,
+}
+
+// Connection / Transaction 共通API定義
+pub trait QueryExecutor {
+    async fn execute(&self, sql: &str, params: impl Send + Params + 'static) -> Result<usize>;
+    async fn query<T, F, P>(&self, sql: &str, params: P, f: F) -> Result<Vec<T>>
+    where
+        P: Send + Params + 'static,
+        F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T> + Send + 'static,
+        T: Send + 'static;
+}
+
+impl QueryExecutor for DataBase {
+    async fn execute(&self, sql: &str, params: impl Send + Params + 'static) -> Result<usize> {
+        tokio::task::spawn_blocking({
+            let conn = self.conn.clone();
+            let sql = sql.to_string();
+            move || {
+                let conn = conn.blocking_lock();
+                let count = conn.execute(&sql, params)?;
+                Ok(count)
+            }
+        })
+        .await?
+    }
+
+    async fn query<T, F, P>(&self, sql: &str, params: P, f: F) -> Result<Vec<T>>
+    where
+        P: Send + Params + 'static,
+        F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let conn = self.conn.clone();
+        let sql = sql.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn.prepare(&sql)?;
+            let mut f = f;
+            let rows = stmt.query_map(params, |row| f(row))?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            Ok(results)
+        })
+        .await?
+    }
+}
+
+impl<'a> QueryExecutor for QueryTransaction<'a> {
+    async fn execute(&self, sql: &str, params: impl Send + Params + 'static) -> Result<usize> {
+        let sql = sql.to_string();
+        let count = self.tx.execute(&sql, params)?;
+        Ok(count)
+    }
+
+    async fn query<T, F, P>(&self, sql: &str, params: P, f: F) -> Result<Vec<T>>
+    where
+        P: Send + Params + 'static,
+        F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let sql = sql.to_string();
+        let mut f = f;
+
+        let mut stmt = self.tx.prepare(&sql)?;
+        let rows = stmt.query_map(params, |row| f(row))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+
+        Ok(results)
+    }
 }
 
 #[allow(dead_code)]
@@ -43,24 +118,8 @@ impl DataBase {
         })
     }
 
-    /// 単純なSQL文を実行します（INSERT, UPDATE, DELETEなど）
-    pub async fn execute<P>(&self, sql: &str, params: P) -> Result<usize>
-    where
-        P: Send + Params + 'static,
-    {
-        let conn = self.conn.clone();
-        let sql = sql.to_string();
-
-        let result = tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            conn.execute(&sql, params)
-        })
-        .await??;
-        
-        Ok(result)
-    }
-
     /// SELECT文を実行し、1行だけ結果を取得します
+    #[deprecated(note = "query_row is deprecated, please use QueryExecutor::query instead")]
     pub async fn query_row<T, F, P>(&self, sql: &str, params: P, f: F) -> Result<T>
     where
         P: Send + Params + 'static,
@@ -75,11 +134,12 @@ impl DataBase {
             conn.query_row(&sql, params, f)
         })
         .await??;
-        
+
         Ok(result)
     }
 
     /// SELECT文を実行し、複数行の結果をベクタとして返します
+    #[deprecated(note = "query_map is deprecated, please use QueryExecutor::query instead")]
     pub async fn query_map<T, F, P>(&self, sql: &str, params: P, mut f: F) -> Result<Vec<T>>
     where
         P: Send + Params + 'static,
@@ -104,10 +164,11 @@ impl DataBase {
 
     /// 一連の処理をトランザクションとして安全に実行します。
     /// atomic に実行され、他スレッドからブロックされます。
-    pub async fn exclusive_transaction<F, T>(&self, f: F) -> Result<T>
+    pub async fn exclusive_transaction<F, T, E>(&self, f: F) -> Result<T, E>
     where
-        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<T> + Send + 'static,
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<T, E> + Send + 'static,
         T: Send + 'static,
+        E: From<rusqlite::Error> + From<tokio::task::JoinError> + Send + 'static,
     {
         let conn = self.conn.clone();
 
@@ -139,7 +200,7 @@ impl DataBase {
         self.execute_batch(&sql).await?;
         Ok(())
     }
-    
+
     /// データベース情報ダンプ
     /// データベースをSQL形式でダンプし、指定したファイルに出力します。
     pub async fn dump_database<P: AsRef<Path>>(&self, path: P) -> Result<(), anyhow::Error> {
@@ -197,12 +258,7 @@ impl DataBase {
                             values.push(val_str);
                         }
 
-                        writeln!(
-                            file,
-                            "INSERT INTO {} VALUES({});",
-                            name,
-                            values.join(", ")
-                        )?;
+                        writeln!(file, "INSERT INTO {} VALUES({});", name, values.join(", "))?;
                     }
                 }
             }
@@ -211,5 +267,23 @@ impl DataBase {
             Ok::<_, anyhow::Error>(())
         })
         .await?
+    }
+}
+
+pub struct QueryTransaction<'conn> {
+    tx: rusqlite::Transaction<'conn>,
+}
+
+impl<'conn> QueryTransaction<'conn> {
+    pub fn new(tx: rusqlite::Transaction<'conn>) -> Self {
+        Self { tx }
+    }
+
+    pub fn rollback(self) -> rusqlite::Result<()> {
+        self.tx.rollback()
+    }
+
+    pub fn commit(self) -> rusqlite::Result<()> {
+        self.tx.commit()
     }
 }

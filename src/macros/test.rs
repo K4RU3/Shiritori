@@ -60,3 +60,69 @@ pub fn assert_room_not_found<T: Debug + PartialEq + Eq>(result: Result<T, RepoEr
         result
     );
 }
+
+#[macro_export]
+macro_rules! define_test_guard {
+    ($repo_ty:ty) => {
+        use std::sync::Arc;
+
+        struct TestGuard {
+            repo: Arc<$repo_ty>,
+            dumppath: String,
+        }
+
+        impl Drop for TestGuard {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    eprintln!("Test failed — dumping database...");
+
+                    let dumppath = self.dumppath.clone();
+                    let repo = self.repo.clone();
+
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("failed to build runtime for dump");
+
+                        rt.block_on(async move {
+                            if let Err(e) = repo.db.dump_database(&dumppath).await {
+                                eprintln!("Failed to dump database: {:?}", e);
+                            } else {
+                                eprintln!("Database dumped successfully to {}", dumppath);
+
+                                let sqlite_path =
+                                    format!("{}.sqlite", dumppath.trim_end_matches(".dump"));
+                                let status = std::process::Command::new("sqlite3")
+                                    .arg(&sqlite_path)
+                                    .arg(format!(".read {}", dumppath))
+                                    .status();
+
+                                match status {
+                                    Ok(s) if s.success() => {
+                                        eprintln!(
+                                            "Database file created successfully: {}",
+                                            dumppath
+                                        );
+                                    }
+                                    Ok(s) => {
+                                        eprintln!(
+                                            "sqlite3 exited with non-zero status: {} (dump at {})",
+                                            s, dumppath
+                                        );
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "Failed to invoke sqlite3: {:?} (dump at {})",
+                                            e, dumppath
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    });
+                }
+            }
+        }
+    };
+}
