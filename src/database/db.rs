@@ -270,6 +270,34 @@ impl DataBase {
     }
 }
 
+impl DataBase {
+    /// トランザクションを開始します。
+    pub async fn transaction<F, T>(&self, mut f: F) -> Result<T>
+    where
+        F: for<'tx> FnMut(&'tx QueryTransaction<'tx>) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let conn = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.blocking_lock();
+            let tx = conn.transaction()?;
+            let query_tx = QueryTransaction::new(tx);
+            match f(&query_tx) {
+                Ok(result) => {
+                    query_tx.commit()?;
+                    Ok(result)
+                }
+                Err(e) => {
+                    query_tx.rollback()?;
+                    Err(e)
+                }
+            }
+        })
+        .await?
+    }
+}
+
 pub struct QueryTransaction<'conn> {
     tx: rusqlite::Transaction<'conn>,
 }
