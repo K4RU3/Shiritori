@@ -2,7 +2,7 @@ use std::{io::Write, sync::Arc, time::Duration};
 
 use chrono::Local;
 use dotenv::dotenv;
-use serenity::{all::GatewayIntents, Client};
+use serenity::{Client, all::GatewayIntents};
 use shiritori_v3::{arc_rwlock, bot_handler::Handler, room::RoomManager};
 use tokio::{signal, sync::RwLock, time};
 
@@ -20,8 +20,10 @@ async fn main() {
     // ボットのトークン（環境変数から取得も可）
     dotenv().ok();
     let token = std::env::var("DISCORD_BOT_TOKEN").expect("DISCORD_BOT_KEY not set");
-    let room_path = std::env::var("ROOMS_PATH").expect("ROOMS_PATH not set. example: ./save/rooms.json");
-    let word_path = std::env::var("WORDS_PATH").expect("WORDS_PATH not set. example: ./save/words/");
+    let room_path =
+        std::env::var("ROOMS_PATH").expect("ROOMS_PATH not set. example: ./save/rooms.json");
+    let word_path =
+        std::env::var("WORDS_PATH").expect("WORDS_PATH not set. example: ./save/words/");
     let manager = arc_rwlock!(RoomManager::load_or_new(&room_path).await);
 
     // ハンドラ作成
@@ -54,10 +56,14 @@ async fn main() {
         let word_path_clone = word_path.to_string();
 
         tokio::spawn(async move {
-            let mut interval = time::interval(Duration::from_secs(86400)); // 1日ごと
+            // let mut interval = time::interval(Duration::from_secs(86400)); // 1日ごと
+            let mut interval = time::interval(Duration::from_secs(5 * 60)); // 5分ごと
             loop {
                 interval.tick().await;
-                let _ = manager_clone.write().await.save_all(&room_path_clone, &word_path_clone);
+                let _ = manager_clone
+                    .write()
+                    .await
+                    .save_all(&room_path_clone, &word_path_clone);
                 let now = Local::now();
                 println!("[{}] 定期保存完了", now.format("%Y-%m-%d %H:%M:%S"));
             }
@@ -84,8 +90,9 @@ async fn main() {
         // Linux SIGTERM
         #[cfg(unix)]
         tokio::spawn(async move {
-            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("Failed to listen for SIGTERM");
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("Failed to listen for SIGTERM");
             term.recv().await;
             shutdown(manager_clone, &room_path_clone, &word_path_clone).await;
         });
