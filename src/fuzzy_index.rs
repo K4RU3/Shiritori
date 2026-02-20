@@ -2,9 +2,10 @@ use bincode::{Decode, Encode};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc};
-use tokio::sync::RwLock;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use thiserror::Error;
+use tokio::sync::RwLock;
 
 use crate::arc_rwlock;
 
@@ -49,15 +50,9 @@ impl Node {
 
     fn search_match(&self, query: &str, mode: MatchMode, results: &mut Vec<String>) {
         let matched = match mode {
-            MatchMode::Prefix => {
-                self.word.starts_with(query) || query.starts_with(&self.word)
-            }
-            MatchMode::Suffix => {
-                self.word.ends_with(query) || query.ends_with(&self.word)
-            }
-            MatchMode::Substring => {
-                self.word.contains(query) || query.contains(&self.word)
-            }
+            MatchMode::Prefix => self.word.starts_with(query) || query.starts_with(&self.word),
+            MatchMode::Suffix => self.word.ends_with(query) || query.ends_with(&self.word),
+            MatchMode::Substring => self.word.contains(query) || query.contains(&self.word),
             MatchMode::Exact => self.word == query,
         };
 
@@ -99,7 +94,10 @@ pub enum IndexError {
 
 impl FuzzyIndex {
     pub fn new() -> Self {
-        Self { root: None, words_set: HashSet::new() }
+        Self {
+            root: None,
+            words_set: HashSet::new(),
+        }
     }
 
     /// 単語を追加
@@ -176,22 +174,42 @@ impl FuzzyIndex {
     }
 }
 
+#[derive(Debug)]
+struct SharedInner {
+    pub index: FuzzyIndex,
+    pub dirty: bool,
+}
+
+impl SharedInner {
+    fn new(index: FuzzyIndex) -> Self {
+        Self {
+            index,
+            dirty: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SharedFuzzyIndex {
-    inner: Arc<RwLock<FuzzyIndex>>,
+    inner: Arc<RwLock<SharedInner>>,
 }
 
 impl SharedFuzzyIndex {
     pub fn new() -> Self {
         Self {
-            inner: arc_rwlock!(FuzzyIndex::new()),
+            inner: arc_rwlock!(SharedInner::new(FuzzyIndex::new())),
         }
     }
 
     /// 単語追加
     pub async fn add_word(&self, word: String) -> bool {
-        let mut index = self.inner.write().await;
-        index.add_word(word)
+        let mut inner = self.inner.write().await;
+        let result = inner.index.add_word(word);
+        if result {
+            inner.dirty = true;
+        }
+
+        result
     }
 
     // 単語群追加
@@ -200,26 +218,34 @@ impl SharedFuzzyIndex {
         I: IntoIterator<Item = S>,
         S: Into<String> + Clone,
     {
-        let mut idx = self.inner.write().await;
-        idx.add_words(words)
+        let mut inner = self.inner.write().await;
+        inner.index.add_words(words)
     }
 
     /// 曖昧検索
     pub async fn search_fuzzy(&self, query: &str, max_dist: usize) -> Vec<String> {
-        let index = self.inner.read().await;
-        index.search_fuzzy(query, max_dist)
+        let inner = self.inner.read().await;
+        inner.index.search_fuzzy(query, max_dist)
     }
 
     /// 部分一致検索
     pub async fn search_match(&self, query: &str, mode: MatchMode) -> Vec<String> {
-        let index = self.inner.read().await;
-        index.search_match(query, mode)
+        let inner = self.inner.read().await;
+        inner.index.search_match(query, mode)
     }
 
     /// 保存
     pub async fn save<P: AsRef<std::path::Path>>(&self, path: P) -> Result<(), IndexError> {
-        let index = self.inner.read().await;
-        index.save(path)?;
+        let mut inner = self.inner.write().await;
+
+        if !inner.dirty {
+            return Ok(()); // Not changed
+        }
+
+        inner.index.save(path)?;
+
+        inner.dirty = false;
+
         Ok(())
     }
 
@@ -227,7 +253,7 @@ impl SharedFuzzyIndex {
     pub fn load<P: AsRef<std::path::Path>>(path: P) -> Result<Self, IndexError> {
         let index = FuzzyIndex::load(path)?;
         Ok(Self {
-            inner: arc_rwlock!(index),
+            inner: arc_rwlock!(SharedInner::new(index)),
         })
     }
 }
