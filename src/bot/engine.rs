@@ -618,7 +618,7 @@ mod tests {
     }
 
     /// バックグラウンドの意味検索タスクが完了するまで待つ(決定常にクリア)
-    async fn settle_background_tasks() {
+    pub(crate) async fn settle_background_tasks() {
         for _ in 0..5 {
             tokio::task::yield_now().await;
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -626,7 +626,10 @@ mod tests {
     }
 
     /// 検証ヘルパー(asyncコンテキスト内で使う)
-    async fn read_room(bot: &Bot, room_id: u64) -> (Vec<u64>, Option<VoteData>, Vec<String>) {
+    pub(crate) async fn read_room(
+        bot: &Bot,
+        room_id: u64,
+    ) -> (Vec<u64>, Option<VoteData>, Vec<String>) {
         let room_arc = bot.manager.get_or_new_room(room_id).await;
         let room = room_arc.read().await;
         (
@@ -1001,6 +1004,79 @@ pub async fn can_manage(manager: &RoomManager, room_id: u64, user_id: u64) -> bo
     let room_arc = manager.get_or_new_room(room_id).await;
     let room = room_arc.read().await;
     room.user_queue.is_empty() || room.user_queue.contains(&user_id)
+}
+
+#[cfg(test)]
+mod persistence_repro_tests {
+    use crate::{RoomManager, bot::SharedMessenger, mean::NoopMeaningProvider};
+
+    /// 実際の運用フロー(起動→プレイ→可決→保存→「再起動」→読み込み)を再現し、
+    /// 辞書・キュー・表示名が再起動後も残ることを検証する
+    #[tokio::test]
+    async fn words_survive_save_and_reload() {
+        use std::fs;
+
+        let dir = "/tmp/shiritori_engine_e2e";
+        let _ = fs::remove_dir_all(dir);
+        fs::create_dir_all(dir).unwrap();
+        let path = format!("{dir}/data.json");
+
+        // ---- 1回目の起動: ルーム登録 → プレイ → 可決 → 保存 ----
+        let manager = RoomManager::new();
+        let bot = crate::bot::Bot::new(
+            manager.clone(),
+            std::sync::Arc::new(NoopMeaningProvider),
+            None,
+        );
+        // 表示名(メンション/ready時のフロー相当)
+        manager
+            .set_room_name(1000, "Test Guild/general".to_string())
+            .await;
+        let fake = std::sync::Arc::new(super::tests::FakeMessenger::default());
+        let msgr: SharedMessenger = fake.clone();
+        super::set_queue(&msgr, &manager, 1000, vec![1, 2, 3]).await;
+        super::try_word(&bot, &msgr, 1000, 1, "apple").await;
+        super::tests::settle_background_tasks().await;
+        let vote_msg = 2; // set_queueの送信(1)の次のプレースホルダー
+        // 過半数で可決(回答者1を除く2人中2票)
+        super::reaction_changed(&bot, &msgr, 1000, vote_msg, 2, "👍", true).await;
+        super::reaction_changed(&bot, &msgr, 1000, vote_msg, 3, "👍", true).await;
+        let (_, _, words) = super::tests::read_room(&bot, 1000).await;
+        assert!(words.contains(&"apple".to_string()));
+
+        manager.save_file(&path).await.unwrap();
+        let disk = fs::read_to_string(&path).unwrap();
+        assert!(disk.contains("apple"), "保存時に単語が含まれている: {disk}");
+
+        // ---- 再起動: ファイルから読み込み直す ----
+        let reloaded = RoomManager::load_file(&path).await.unwrap();
+        assert!(reloaded.has_room(1000).await);
+        let room_arc = reloaded.get_or_new_room(1000).await;
+        let room = room_arc.read().await;
+        assert!(room.words.contains("apple"), "再起動後も単語が残る");
+        assert_eq!(room.user_queue, vec![2, 3, 1]);
+        assert_eq!(
+            room.name.as_deref(),
+            Some("Test Guild/general"),
+            "表示名も残る"
+        );
+        assert!(room.vote.is_none());
+
+        // ---- 再起動後も完全一致は棄却される ----
+        drop(room);
+        let bot2 = crate::bot::Bot::new(
+            reloaded.clone(),
+            std::sync::Arc::new(NoopMeaningProvider),
+            None,
+        );
+        let fake2 = std::sync::Arc::new(super::tests::FakeMessenger::default());
+        let msgr2: SharedMessenger = fake2.clone();
+        super::try_word(&bot2, &msgr2, 1000, 2, "APPLE").await;
+        let (_, vote, _) = super::tests::read_room(&bot2, 1000).await;
+        assert!(vote.is_none(), "既出は即棄却されるため投票は開始されない");
+
+        let _ = fs::remove_dir_all(dir);
+    }
 }
 
 #[cfg(test)]

@@ -30,7 +30,9 @@ async fn main() {
     let manager = match RoomManager::load_file(&path).await {
         Ok(manager) => manager,
         Err(e) => {
-            eprintln!("データファイルの読み込みに失敗({path}): {e}\n空の状態で起動します。");
+            eprintln!(
+                "データファイルの読み込みに失敗({path}): {e}\n{path}.corrupt / {path}.bak を確認してください。空の状態で起動します。"
+            );
             RoomManager::new()
         }
     };

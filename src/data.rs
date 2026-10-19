@@ -96,6 +96,29 @@ impl SaveData {
             rooms: HashMap::new(),
         }
     }
+
+    /// JSON文字列を v4 形式として解析・検証する
+    ///
+    /// - format不一致はエラー
+    /// - version差異は警告ログのみで続行(読み込み互換性を優先)
+    pub fn decode(json: &str) -> Result<SaveData, LoadError> {
+        let data: SaveData = serde_json::from_str(json)?;
+        if data.format != FORMAT_ID {
+            return Err(LoadError::FormatMismatch(data.format));
+        }
+        if data.version > FORMAT_VERSION {
+            println!(
+                "[警告] データファイルのバージョン({})が現在({})より新しいです。読み込んで続行します。",
+                data.version, FORMAT_VERSION
+            );
+        } else if data.version < FORMAT_VERSION {
+            println!(
+                "[警告] データファイルのバージョン({})が現在({})より古いです。",
+                data.version, FORMAT_VERSION
+            );
+        }
+        Ok(data)
+    }
 }
 
 /// ランタイムのルーム状態
@@ -218,6 +241,20 @@ impl RoomManager {
         list.into_iter().map(|(_, pair)| pair).collect()
     }
 
+    /// 全ルームを与えられたSaveDataで置き換える(v4形式import用)
+    pub async fn replace_with(&self, data: SaveData) {
+        let rooms: HashMap<u64, Arc<RwLock<RoomState>>> = data
+            .rooms
+            .into_iter()
+            .map(|(room_id, room_data)| {
+                let room = RoomState::from_data(room_id, room_data);
+                (room_id, Arc::new(RwLock::new(room)))
+            })
+            .collect();
+
+        *self.rooms.write().await = rooms;
+    }
+
     /// 現在の状態を SaveData にスナップショットする
     pub async fn snapshot(&self) -> SaveData {
         let mut data = SaveData::new();
@@ -229,6 +266,20 @@ impl RoomManager {
         }
 
         data
+    }
+
+    /// 起動時のサマリ(ルーム数・辞書語数)を1行で返す。load 後の状態確認用
+    async fn summarize_loaded(&self) -> String {
+        let room_count;
+        let mut words = 0usize;
+        {
+            let rooms = self.rooms.read().await;
+            room_count = rooms.len();
+            for arc in rooms.values() {
+                words += arc.read().await.words.len();
+            }
+        }
+        format!("ルーム{room_count}件 / 辞書{words}語")
     }
 
     /// ファイルへ保存する(アトミック書き込み + 直前の状態を .bak に退避)
@@ -260,36 +311,87 @@ impl RoomManager {
         Self::write_file(&data, path)
     }
 
-    /// ファイルから読み込む。ファイルがなければ空のマネージャーを返す。
+    /// ファイルから読み込む。
     ///
     /// - 未知フィールドはserdeにより無視される(将来の互換性)
     /// - version が現在より新しい場合は警告を出して続行(後方互換優先)
+    /// - data.json の解析に失敗した場合/ファイルが欠損している場合は
+    ///   `data.json.bak` からの自動復帰を試みる(保存は rename による世代交代なので
+    ///   .bak に常に直近の完全な状態が残る)
+    /// - 原文が壊れていた場合は `data.json.corrupt` に退避してからエラーを返す
+    /// - 成功時はルーム数/辞書語数のサマリを出力する
     pub async fn load_file(path: &str) -> Result<Self, LoadError> {
         let json = match fs::read_to_string(path) {
             Ok(json) => json,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::new());
+                return Self::recover_from_bak(path, "データファイルが存在しません", None).await;
             }
             Err(e) => return Err(LoadError::Io(e)),
         };
 
-        let data: SaveData = serde_json::from_str(&json)?;
-
-        if data.format != FORMAT_ID {
-            return Err(LoadError::FormatMismatch(data.format));
+        match Self::parse(&json) {
+            Ok(data) => {
+                let manager = Self::build(data);
+                println!("[データ] {}", manager.summarize_loaded().await);
+                Ok(manager)
+            }
+            Err(e) => {
+                // 壊れた原文を退避してから .bak で復帰する
+                let corrupt = format!("{path}.corrupt");
+                let _ = fs::write(&corrupt, json.as_bytes());
+                eprintln!("[警告] 読み込みに失敗({e})。原文を {corrupt} に退避しました。");
+                Self::recover_from_bak(path, &format!("data.jsonの解析に失敗({e})"), Some(e)).await
+            }
         }
-        if data.version > FORMAT_VERSION {
-            println!(
-                "[警告] データファイルのバージョン({})が現在({})より新しいです。読み込んで続行します。",
-                data.version, FORMAT_VERSION
-            );
-        } else if data.version < FORMAT_VERSION {
-            println!(
-                "[警告] データファイルのバージョン({})が現在({})より古いです。",
-                data.version, FORMAT_VERSION
-            );
-        }
+    }
 
+    /// .bak からの復帰。
+    ///
+    /// - bak から復帰できた場合は警告+サマリつきで返す
+    /// - bak も存在しない場合: 本体も無ければ初回起動として Ok(空)、
+    ///   本体の解析エラーがあればそのエラーを Err で返す(空状態での起動は呼び出し元の責務)
+    /// - bak はあるが解析できない場合: 元エラー(または FormatMismatch)を返す
+    async fn recover_from_bak(
+        path: &str,
+        reason: &str,
+        original: Option<LoadError>,
+    ) -> Result<Self, LoadError> {
+        let bak = format!("{path}.bak");
+        match fs::read_to_string(&bak) {
+            Ok(json) => match Self::parse(&json) {
+                Ok(data) => {
+                    let manager = Self::build(data);
+                    eprintln!(
+                        "[警告] {reason} → {bak} から復旧しました。{}",
+                        manager.summarize_loaded().await
+                    );
+                    Ok(manager)
+                }
+                Err(e) => {
+                    eprintln!("[警告] {reason} → {bak} も解析に失敗({e})。空の状態で起動します。");
+                    Err(original.unwrap_or(LoadError::FormatMismatch(bak)))
+                }
+            },
+            Err(io) if io.kind() == std::io::ErrorKind::NotFound => match original {
+                Some(e) => {
+                    eprintln!(
+                        "[警告] {reason} → {bak} も存在せず復帰できません。空の状態で起動します。"
+                    );
+                    Err(e)
+                }
+                None => Ok(Self::new()),
+            },
+            Err(e) => Err(LoadError::Io(e)),
+        }
+    }
+
+    /// JSON文字列を解析する。format不一致はエラー、version差異は警告のみで続行
+    fn parse(json: &str) -> Result<SaveData, LoadError> {
+        SaveData::decode(json)
+    }
+
+    /// SaveDataからランタイムのマネージャーを構築する
+    fn build(data: SaveData) -> Self {
         let rooms: HashMap<u64, Arc<RwLock<RoomState>>> = data
             .rooms
             .into_iter()
@@ -299,9 +401,9 @@ impl RoomManager {
             })
             .collect();
 
-        Ok(Self {
+        Self {
             rooms: Arc::new(RwLock::new(rooms)),
-        })
+        }
     }
 }
 
@@ -549,5 +651,112 @@ mod tests {
         let json = r#"{"user_queue":[],"words":[]}"#;
         let data: RoomData = serde_json::from_str(json).unwrap();
         assert!(data.name.is_none());
+    }
+    // ===== 起動時の自動復帰(.bak)と破損退避(.corrupt) =====
+
+    /// 直近2世代がそろったテストデータを作る(seed語を1世代目のみに含める)
+    async fn seed_two_generations(dir: &str) {
+        use std::fs;
+        fs::create_dir_all(dir).unwrap();
+        let path = format!("{dir}/data.json");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{path}.bak"));
+
+        // 1世代目: banana を含む状態で保存→.bakに退避される
+        let m1 = RoomManager::new();
+        let room = m1.get_or_new_room(100).await;
+        room.write().await.words.add_word("banana");
+        drop(room);
+        m1.save_file(&path).await.unwrap();
+
+        // 2世代目: apple を含む状態で保存(1世代目は.bakへ)
+        let m2 = RoomManager::new();
+        let room = m2.get_or_new_room(100).await;
+        room.write().await.words.add_word("apple");
+        drop(room);
+        m2.save_file(&path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn corrupt_data_file_recovers_from_bak() {
+        use std::fs;
+
+        let dir = "/tmp/shiritori_data_recover";
+        seed_two_generations(dir).await;
+
+        let path = format!("{dir}/data.json");
+        // 本体を壊す
+        fs::write(&path, br#"not a json{{{"#).unwrap();
+
+        let loaded = RoomManager::load_file(&path).await.unwrap();
+        let room = loaded.get_or_new_room(100).await;
+        assert!(
+            room.read().await.words.contains("banana"),
+            ".bak(1世代前)から復旧できている"
+        );
+        // 原文が.corruptに退避されている
+        assert!(fs::metadata(format!("{path}.corrupt")).is_ok());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn wrong_format_data_file_recovers_from_bak() {
+        use std::fs;
+
+        let dir = "/tmp/shiritori_data_recover_fmt";
+        seed_two_generations(dir).await;
+
+        let path = format!("{dir}/data.json");
+        // format が違うが JSON としては正当なデータ
+        fs::write(
+            &path,
+            br#"{"format":"other-app","version":1,"saved_at":1,"rooms":{}}"#,
+        )
+        .unwrap();
+
+        let loaded = RoomManager::load_file(&path).await.unwrap();
+        let room = loaded.get_or_new_room(100).await;
+        assert!(
+            room.read().await.words.contains("banana"),
+            ".bakから復旧できている"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn missing_data_file_recovers_from_bak() {
+        use std::fs;
+
+        let dir = "/tmp/shiritori_data_recover_missing";
+        seed_two_generations(dir).await;
+
+        let path = format!("{dir}/data.json");
+        // 世代交代中のkill相当: 本体だけ消える
+        fs::remove_file(&path).unwrap();
+
+        let loaded = RoomManager::load_file(&path).await.unwrap();
+        let room = loaded.get_or_new_room(100).await;
+        assert!(
+            room.read().await.words.contains("banana"),
+            "本体欠損時も.bakから復旧できている"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn no_files_at_all_starts_empty() {
+        use std::fs;
+
+        let dir = "/tmp/shiritori_data_fresh";
+        fs::create_dir_all(dir).unwrap();
+        let path = format!("{dir}/data.json");
+
+        let loaded = RoomManager::load_file(&path).await.unwrap();
+        assert!(loaded.snapshot().await.rooms.is_empty());
+
+        let _ = fs::remove_dir_all(dir);
     }
 }

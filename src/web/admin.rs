@@ -205,6 +205,7 @@ pub async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
     html.push_str(
         r#"<h2>操作</h2><ul>
 <li><a href="/admin/export">現在のデータをJSONでダウンロード(/admin/export)</a></li>
+<li><a href="/admin/import">新形式(v4)データのインポート(/admin/import)</a></li>
 <li><a href="/admin/upload">旧形式(v3)データのインポート(/admin/upload)</a></li>
 <li><a href="/admin/logout">ログアウト</a></li>
 </ul>"#,
@@ -701,6 +702,154 @@ pub async fn upload_form(
     Html(html).into_response()
 }
 
+/// POST /admin/import : v4形式(data.json)の全量インポート
+///
+/// - 受け取ったJSONを v4 形式として検証(format不一致/未来versionは拒否)
+/// - 適用前に現状をバックアップ保存(.bakに退避)し、全ルームを置き換え
+/// - 成功後はディスクへ即時保存
+pub async fn import_v4_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Response {
+    if require_session(&state, &headers).is_err() {
+        return Redirect::to("/admin/login").into_response();
+    }
+    if !is_same_origin(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            Html("不正な送信元のため拒否しました。".to_string()),
+        )
+            .into_response();
+    }
+
+    let mut json = None;
+    let mut errors: Vec<String> = Vec::new();
+    let mut mp = multipart;
+    loop {
+        let field = match mp.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(err) => {
+                errors.push(format!("アップロード読み取りエラー: {err}"));
+                break;
+            }
+        };
+        if field.name() == Some("data") {
+            match field.bytes().await {
+                Ok(bytes) => json = Some(String::from_utf8_lossy(&bytes).into_owned()),
+                Err(err) => errors.push(format!("data.json 読み込みエラー: {err}")),
+            }
+        }
+    }
+
+    let result = match json {
+        Some(json) => apply_v4_import(&state.manager, &state.data_path, &json).await,
+        None => {
+            errors.push("data.json がアップロードされていません。".to_string());
+            Err(errors)
+        }
+    };
+
+    let mut html = SHARED_PAGE_HEAD.to_string();
+    match result {
+        Ok(text) => {
+            html.push_str("<h1>インポート結果</h1>\n<p>");
+            html.push_str(&escape_html_basic(&text));
+            html.push_str("</p>");
+        }
+        Err(errors) => {
+            html.push_str("<h1>インポート失敗</h1>\n<ul>");
+            for e in &errors {
+                html.push_str(&format!(
+                    "<li style=\"color:red\">{}</li>",
+                    escape_html_basic(e)
+                ));
+            }
+            html.push_str("</ul>");
+            html.push_str(
+                "<p>既存データは変更されていません(検証失敗時は置き換え前に中断しています)。</p>",
+            );
+        }
+    }
+    html.push_str(r#"<p><a href="/admin">管理画面へ戻る</a> / <a href="/admin/import">もう一度インポート</a></p>"#);
+    html.push_str("</body></html>");
+    Html(html).into_response()
+}
+
+/// GET /admin/import : v4形式(data.json)インポートフォーム
+pub async fn import_v4_form(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if require_session(&state, &headers).is_err() {
+        return Redirect::to("/admin/login").into_response();
+    }
+
+    let mut html = SHARED_PAGE_HEAD.to_string();
+    html.push_str("<h1>v4データのインポート</h1>\n");
+    html.push_str(
+        "<p>新形式(shiritori-data形式の data.json)をフルでインポートします。存在データは「置き換え」が発生します。
+適用前に現在の状態バックアップが自動的に保存されます。</p>\n",
+    );
+    html.push_str(
+        r#"<form method="post" action="/admin/import" enctype="multipart/form-data">
+<label>data.json: <input type="file" name="data" accept=".json"></label><br>
+<button type="submit">インポート(置き換え)</button>
+</form>"#,
+    );
+    html.push_str(
+        r#"<p>※ 旧形式(v3)のデータは <a href="/admin/upload">v3インポートページ</a> を使用してください。</p>"#,
+    );
+    html.push_str(r#"<p><a href="/admin">管理画面へ戻る</a></p>"#);
+    html.push_str("</body></html>");
+    Html(html).into_response()
+}
+
+/// v4形式data.jsonの検証と全量インポート。
+///
+/// 戻り値: Ok=要約 / Err=メッセージ一覧(既存データは無変更)
+pub async fn apply_v4_import(
+    manager: &crate::data::RoomManager,
+    data_path: &str,
+    json: &str,
+) -> Result<String, Vec<String>> {
+    let data = match crate::data::SaveData::decode(json) {
+        Ok(d) => d,
+        Err(err) => {
+            return Err(vec![format!(
+                "data.json が v4 形式として正しくありません: {err}"
+            )]);
+        }
+    };
+
+    let mut rooms = 0usize;
+    let mut words = 0usize;
+    let mut votes = 0usize;
+    for room_data in data.rooms.values() {
+        rooms += 1;
+        words += room_data.words.len();
+        if room_data.vote.is_some() {
+            votes += 1;
+        }
+    }
+
+    // 現状をバックアップ退避(.bakに回転)
+    if let Err(err) = manager.save_file(data_path).await {
+        return Err(vec![format!(
+            "インポート前にバックアップ退避に失敗したため中断しました: {err}"
+        )]);
+    }
+
+    manager.replace_with(data).await;
+
+    if let Err(err) = manager.save_file(data_path).await {
+        return Err(vec![format!(
+            "インポート後の保存に失敗しました(メモリ上は反映済み): {err}"
+        )]);
+    }
+
+    Ok(format!(
+        "ルーム {rooms}件 / 辞書 {words}語 / 進行中投票 {votes}件 のデータをインポートしました。"
+    ))
+}
 /// HTMLエスケープ(最小限・クエリパラメータ表示用)
 fn escape_html_basic(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -713,6 +862,9 @@ mod tests {
     use super::*;
     use crate::data::RoomManager;
     use crate::web::{AppState, WebConfig};
+    use axum::extract::Request;
+    use axum::http::Method;
+    use tower::ServiceExt;
 
     fn test_state() -> AppState {
         AppState::new(
@@ -1196,5 +1348,154 @@ mod tests {
         .await;
         let body = body_text(response).await;
         assert!(body.contains("存在しません"));
+    }
+    // ===== v4形式(data.json)インポート =====
+
+    #[tokio::test]
+    async fn apply_v4_import_replaces_everything_and_backs_up() {
+        use std::fs;
+
+        let dir = "/tmp/shiritori_test_admin/v4import";
+        fs::create_dir_all(dir).unwrap();
+        let path = format!("{dir}/data.json");
+        let _ = fs::remove_file(format!("{path}.bak"));
+
+        let manager = crate::data::RoomManager::new();
+        {
+            let room = manager.get_or_new_room(1000).await;
+            room.write().await.words.add_word("banana");
+        }
+        manager.save_file(&path).await.unwrap();
+
+        // v4形式の入力(既存room 1000は消え、999に置き換わる)
+        let json = r#"{
+            "format": "shiritori-data",
+            "version": 1,
+            "saved_at": 1,
+            "rooms": {
+                "999": { "name": "Srv/ch", "user_queue": [3, 4], "words": ["apple", "GRAPE"], "vote": null }
+            }
+        }"#;
+        let summary = apply_v4_import(&manager, &path, json).await.unwrap();
+        assert!(summary.contains("ルーム 1件"));
+        assert!(summary.contains("辞書 2語"));
+
+        // 既存ルームは消え、新データに置き換わる
+        assert!(!manager.has_room(1000).await);
+        let room = manager.get_or_new_room(999).await;
+        let r = room.read().await;
+        assert!(r.words.contains("apple"));
+        assert!(r.words.contains("grape")); // 正規化(lowercase)も有効
+        assert_eq!(r.user_queue, vec![3, 4]);
+        assert_eq!(r.name.as_deref(), Some("Srv/ch"));
+        drop(r);
+
+        // ディスクに即時保存されている
+        let disk = fs::read_to_string(&path).unwrap();
+        assert!(disk.contains("Srv/ch"));
+        // 現状のバックアップ(.bak)が退避されている
+        let bak = fs::read_to_string(format!("{path}.bak")).unwrap();
+        assert!(bak.contains("banana"));
+        assert!(!bak.contains("Srv/ch"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn apply_v4_import_rejects_invalid_data_unchanged() {
+        use std::fs;
+
+        let dir = "/tmp/shiritori_test_admin/v4badimport";
+        fs::create_dir_all(dir).unwrap();
+        let path = format!("{dir}/data.json");
+        let manager = crate::data::RoomManager::new();
+        {
+            let room = manager.get_or_new_room(1000).await;
+            room.write().await.words.add_word("banana");
+        }
+        manager.save_file(&path).await.unwrap();
+
+        // 破損JSON
+        assert!(
+            apply_v4_import(&manager, &path, "not json{{")
+                .await
+                .is_err()
+        );
+        // format不一致
+        let err = apply_v4_import(
+            &manager,
+            &path,
+            r#"{"format":"other","version":9,"saved_at":1,"rooms":{}}"#,
+        )
+        .await
+        .unwrap_err();
+        assert!(err[0].contains("v4 形式として正しくありません"));
+
+        // 既存データ無変更
+        let room = manager.get_or_new_room(1000).await;
+        assert!(room.read().await.words.contains("banana"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn import_v4_post_requires_session_and_parses_multipart() {
+        use std::fs;
+
+        let dir = "/tmp/shiritori_test_admin/v4post";
+        fs::create_dir_all(dir).unwrap();
+        let mut state = test_state();
+        state.data_path = format!("{dir}/data.json");
+        state.manager.get_or_new_room(1).await;
+
+        let json = r#"{"format":"shiritori-data","version":1,"saved_at":1,"rooms":{"77":{"user_queue":[2,3],"words":["pear"]}}}"#;
+        let body = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"data\"; filename=\"data.json\"\r\nContent-Type: application/json\r\n\r\n{j}\r\n--{b}--\r\n",
+            b = "--bOwN---dArY--".trim_start_matches("--"),
+            j = json
+        );
+
+        // 未認証 → 302
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/admin/import")
+            .header(
+                "content-type",
+                "multipart/form-data; boundary=bOwN---dArY--",
+            )
+            .body(axum::body::Body::from(body.clone()))
+            .unwrap();
+        let router = crate::web::build_router(state.clone());
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(state.manager.has_room(1).await);
+
+        // 認証済み → 成功・置き換え
+        let token = random_token();
+        state.sessions.lock().unwrap().insert(token.clone());
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/admin/import")
+            .header(
+                "content-type",
+                "multipart/form-data; boundary=bOwN---dArY--",
+            )
+            .header("cookie", format!("{COOKIE_NAME}={token}"))
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let router = crate::web::build_router(state.clone());
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = body_text(response).await;
+        assert!(text.contains("インポート結果"));
+        assert!(text.contains("ルーム 1件"));
+
+        // ルーム1は消えて77に置き換わっている
+        assert!(!state.manager.has_room(1).await);
+        assert!(state.manager.has_room(77).await);
+        let room = state.manager.get_or_new_room(77).await;
+        assert!(room.read().await.words.contains("pear"));
+
+        let _ = fs::remove_dir_all(dir);
     }
 }

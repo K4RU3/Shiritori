@@ -127,6 +127,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/admin/export", get(admin::export))
         .route("/admin/logout", get(admin::logout))
         .route("/admin/upload", get(admin::upload_form).post(admin::upload))
+        .route(
+            "/admin/import",
+            get(admin::import_v4_form).post(admin::import_v4_post),
+        )
         .route("/admin/room/add", post(admin::room_add))
         .route("/admin/room/delete", post(admin::room_delete))
         .route("/admin/word/add", post(admin::word_add))
