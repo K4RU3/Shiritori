@@ -1,0 +1,8 @@
+# ビルド時に不要なもの
+target/
+data/
+.env
+.git/
+.opencode/
+*.md
+README*

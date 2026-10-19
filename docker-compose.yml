@@ -1,0 +1,32 @@
+# しりとりボット (v4)
+#
+# 起動: docker compose up -d --build
+# 停止: docker compose down  (SIGTERM → 保存完走 → exit 0)
+#
+# 必要な環境変数は .env ファイルか environment で指定する:
+#   DISCORD_BOT_TOKEN=...        (必須)
+#   WEB_BIND=0.0.0.0:8080        (Web機能。以下3つが揃った場合のみ有効)
+#   WEB_PUBLIC_URL=https://...   (ユーザー遷移用公開アドレス)
+#   WEB_PASSWORD=...             (管理画面パスワード)
+#
+services:
+  shiritori:
+    build: .
+    image: shiritori-v4
+    container_name: shiritori-v4
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # データはコンテナ内 /data に固定(ボリュームで永続化)
+      - DATA_DIR=/data
+    volumes:
+      - shiritori-data:/data
+    # Web機能を有効にした場合はポートを公開する
+    # (WEB_BIND=0.0.0.0:8080 を設定した場合のみ待ち受ける)
+    ports:
+      - "8080:8080"
+
+volumes:
+  shiritori-data:

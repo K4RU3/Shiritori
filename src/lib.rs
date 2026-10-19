@@ -1,12 +1,11 @@
-pub mod fuzzy_index;
-pub mod actions;
-pub mod room;
-pub mod message;
-pub mod bot_handler;
-pub mod util;
-pub mod commands;
+pub mod bot;
+pub mod data;
+pub mod lev;
+pub mod mean;
+pub mod web;
+pub mod words;
 
-#[macro_use]
-mod macros;
-
-pub use fuzzy_index::{FuzzyIndex, SharedFuzzyIndex, MatchMode, levenshtein};
+pub use data::{RoomManager, RoomState};
+pub use lev::levenshtein;
+pub use mean::{MeaningProvider, NoopMeaningProvider};
+pub use words::{SearchMode, WordStore};

@@ -3,4 +3,5 @@
 .env
 deploy.sh
 VERSION
+.opencode/
 
