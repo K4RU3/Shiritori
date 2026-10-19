@@ -118,23 +118,26 @@ pub async fn page(
 
 /// 検索を実行する
 ///
-/// room_id が None の場合は全ルームを対象にする。
-/// 戻り値: (ルーム選択肢, (対象ルーム, 検索結果)のリスト)
+/// room_id が None(または存在しない)の場合は全ルームを対象にする。
+/// 戻り値: (ルーム選択肢, (対象ルームID, 表示名, 検索結果)のリスト)
 pub(crate) async fn search_rooms(
     manager: &RoomManager,
     room_id: Option<u64>,
     query: &str,
     mode: SearchKind,
-) -> (Vec<u64>, Vec<(u64, Vec<String>)>) {
-    let all_room_ids = manager.room_ids().await;
+) -> (Vec<(u64, String)>, Vec<(u64, String, Vec<String>)>) {
+    let display: Vec<(u64, String)> = manager.room_display().await;
 
-    let targets: Vec<u64> = match room_id {
-        Some(id) if all_room_ids.contains(&id) => vec![id],
-        _ => all_room_ids.clone(),
+    let targets: Vec<(u64, String)> = match room_id {
+        Some(id) => match display.iter().find(|(rid, _)| *rid == id) {
+            Some(found) => vec![found.clone()],
+            None => display.clone(),
+        },
+        None => display.clone(),
     };
 
     let mut results = Vec::new();
-    for room_id in targets {
+    for (room_id, name) in targets {
         let room_arc = manager.get_or_new_room(room_id).await;
         let room = room_arc.read().await;
         let hits = if query.trim().is_empty() {
@@ -142,10 +145,10 @@ pub(crate) async fn search_rooms(
         } else {
             mode.search(&room.words, query)
         };
-        results.push((room_id, hits));
+        results.push((room_id, name, hits));
     }
 
-    (all_room_ids, results)
+    (display, results)
 }
 
 /// HTMLエスケープ(簡易)
@@ -163,12 +166,14 @@ pub(crate) fn escape_html(text: &str) -> String {
 }
 
 /// 検索ページHTML
+///
+/// room_options: (room_id, 表示名) 一覧 / results: (room_id, 表示名, ヒット語群)
 pub(crate) fn render_search_page(
     query: &str,
     selected_room: Option<u64>,
     mode: SearchKind,
-    room_options: &[u64],
-    results: &[(u64, Vec<String>)],
+    room_options: &[(u64, String)],
+    results: &[(u64, String, Vec<String>)],
 ) -> String {
     let mut html = SHARED_PAGE_HEAD.to_string();
 
@@ -194,19 +199,22 @@ pub(crate) fn render_search_page(
             .collect::<String>(),
         room_options
             .iter()
-            .map(|id| {
+            .map(|(id, name)| {
                 let selected = selected_room.is_some_and(|r| r == *id);
                 let mark = if selected { " selected" } else { "" };
-                format!(r#"<option value="{id}"{mark}>{id}</option>"#)
+                format!(
+                    r#"<option value="{id}"{mark}>{}</option>"#,
+                    escape_html(name)
+                )
             })
             .collect::<String>(),
     ));
 
     // 結果
-    for (room_id, hits) in results {
+    for (room_id, room_name, hits) in results {
         html.push_str(&format!(
-            "<h2>ルーム {} <small>({}件)</small></h2>\n",
-            room_id,
+            "<h2>{} <small>({room_id})({}件) <a href=\"/words?room={room_id}\">全件表示</a></small></h2>\n",
+            escape_html(room_name),
             hits.len()
         ));
         if query.trim().is_empty() {
@@ -285,9 +293,14 @@ mod tests {
     }
 
     async fn manager_with() -> RoomManager {
+        manager_with_named(&[("TestServer/general", 1000)]).await
+    }
+
+    async fn manager_with_named(rooms: &[(&str, u64)]) -> RoomManager {
         let manager = RoomManager::new();
-        // 手動で1ルーム作成
-        manager.get_or_new_room(1000).await;
+        for (name, id) in rooms {
+            manager.set_room_name(*id, name.to_string()).await;
+        }
         manager
     }
 
@@ -302,10 +315,11 @@ mod tests {
         }
 
         let (options, results) = search_rooms(&manager, None, "app", SearchKind::Substring).await;
-        assert!(options.contains(&1000));
+        assert!(options.contains(&(1000, "TestServer/general".to_string())));
         assert_eq!(results.len(), 1);
-        assert!(results[0].1.contains(&"apple".to_string()));
-        assert!(!results[0].1.contains(&"grape".to_string()));
+        assert_eq!(results[0].1, "TestServer/general");
+        assert!(results[0].2.contains(&"apple".to_string()));
+        assert!(!results[0].2.contains(&"grape".to_string()));
 
         // 特定ルーム指定(存在する場合)
         let (_, single) = search_rooms(&manager, Some(1000), "app", SearchKind::Substring).await;
@@ -327,12 +341,16 @@ mod tests {
         let (options, results) = search_rooms(&manager, None, "app", SearchKind::Substring).await;
         let html = render_search_page("app", None, SearchKind::Substring, &options, &results);
 
-        // フォームと結果
+        // フォームと結果(ルームはIDではなくサーバー名/チャンネル名で表示される)
         assert!(html.contains("<form"));
         assert!(html.contains("value=\"app\""));
+        assert!(html.contains("TestServer/general"));
         assert!(!html.contains("見つかりませんでした"));
         assert!(html.contains("<li>apple</li>"));
-        assert!(html.contains("ルーム 1000"));
+        // 選択肢のvalueはroom_id
+        assert!(html.contains(r#"value="1000""#));
+        // 結果ヘッダにも名前(とID補記)が出る
+        assert!(html.contains("TestServer/general <small>(1000)(1件)"));
     }
 
     #[tokio::test]
@@ -357,5 +375,19 @@ mod tests {
         assert!(html.contains("value=\"fuzzy_and_substring\""));
         let html = render_search_page("", None, SearchKind::Exact, &[], &[]);
         assert!(html.contains(r#"<option value="exact" selected>完全一致</option>"#));
+    }
+
+    #[tokio::test]
+    async fn search_select_shows_names_and_escapes_them() {
+        let manager = manager_with_named(&[("危険<な>ルーム&名", 777)]).await;
+        manager.get_or_new_room(777).await;
+
+        let (options, results) = search_rooms(&manager, None, "x", SearchKind::Exact).await;
+        let html = render_search_page("x", Some(777), SearchKind::Exact, &options, &results);
+        // 名前はエスケープされて表示
+        assert!(html.contains("危険&lt;な&gt;ルーム&amp;名"));
+        // 名前付きルームは選択肢の先頭に来る(名前順ソート)
+        assert!(html.contains(r#"value="777" selected"#));
+        assert_eq!(results.len(), 1);
     }
 }

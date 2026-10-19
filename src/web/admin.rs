@@ -37,6 +37,22 @@ pub struct LoginForm {
     pub password: String,
 }
 
+/// POST /admin/room/(add|delete) のフォーム
+#[derive(Deserialize)]
+pub struct RoomForm {
+    pub room_id: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+/// POST /admin/word/(add|delete) のフォーム
+#[derive(Deserialize)]
+pub struct WordForm {
+    pub room_id: String,
+    #[serde(default)]
+    pub words: String,
+}
+
 /// GET /admin/login : ログインフォーム
 pub async fn login_form() -> Html<String> {
     let mut html = SHARED_PAGE_HEAD.to_string();
@@ -155,11 +171,11 @@ pub async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
         state.config.public_url, state.config.public_url
     ));
 
-    // 状態: ルーム集計
-    let room_ids = state.manager.room_ids().await;
+    // 状態: ルーム集計(表示名付き)
+    let room_display = state.manager.room_display().await;
     let mut total_words = 0usize;
-    let mut table = String::from("<table><tr><th>ルームID</th><th>単語数</th><th>状態</th></tr>");
-    for id in &room_ids {
+    let mut table = String::from("<table><tr><th>ルーム</th><th>単語数</th><th>状態</th></tr>");
+    for (id, name) in &room_display {
         let room_arc = state.manager.get_or_new_room(*id).await;
         let room = room_arc.read().await;
         let words = room.words.len();
@@ -175,14 +191,15 @@ pub async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
         };
         let queue_len = room.user_queue.len();
         table.push_str(&format!(
-            "<tr><td>{id}</td><td>{words}</td><td>{status}<br><small>順番待ち {queue_len}人</small></td></tr>"
+            "<tr><td>{} <small>({id})</small></td><td>{words}</td><td>{status}<br><small>順番待ち {queue_len}人</small></td></tr>",
+            escape_html_basic(name)
         ));
     }
     table.push_str("</table>");
 
     html.push_str(&format!(
         "<h2>状態</h2><p>ルーム数: {} / 合計単語数: {total_words}</p>{table}",
-        room_ids.len()
+        room_display.len()
     ));
 
     html.push_str(
@@ -192,6 +209,39 @@ pub async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Res
 <li><a href="/admin/logout">ログアウト</a></li>
 </ul>"#,
     );
+
+    // 単語・ルームの管理フォーム
+    html.push_str("<h2>単語・ルーム管理</h2>\n");
+    html.push_str(
+        r#"<h3>ルーム追加</h3><form method="post" action="/admin/room/add">
+<label>チャンネルID <input type="number" name="room_id" required></label>
+<label>表示名(任意・サーバー名/チャンネル名) <input type="text" name="name"></label>
+<button type="submit">追加</button>
+</form>"#,
+    );
+    html.push_str(&format!(
+        r#"<h3>ルーム削除</h3><form method="post" action="/admin/room/delete">
+<label>ルーム <select name="room_id" required>{}</select></label>
+<button type="submit">削除</button>
+</form>"#,
+        room_options_html(&room_display, false),
+    ));
+    html.push_str(&format!(
+        r#"<h3>単語追加</h3><form method="post" action="/admin/word/add">
+<label>ルーム <select name="room_id" required>{}</select></label>
+<label>単語(カンマ区切り可) <input type="text" name="words" required></label>
+<button type="submit">追加</button>
+</form>"#,
+        room_options_html(&room_display, false),
+    ));
+    html.push_str(&format!(
+        r#"<h3>単語削除</h3><form method="post" action="/admin/word/delete">
+<label>ルーム <select name="room_id" required>{}</select></label>
+<label>単語(カンマ区切り可・評価済み完全一致) <input type="text" name="words" required></label>
+<button type="submit">削除</button>
+</form>"#,
+        room_options_html(&room_display, false),
+    ));
 
     html.push_str("</body></html>");
     Html(html).into_response()
@@ -209,6 +259,244 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Respon
         response.headers_mut().insert(header::SET_COOKIE, value);
     }
     response
+}
+
+// ===== 単語・ルーム管理 =====
+
+/// 加入受付用の英単語の正規表現(1語チェック)
+static WORD_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"^[a-zA-Z][a-zA-Z\-]*$").unwrap());
+
+/// 入力をカンマ/空白区切りで英単語のみ抽出・正規化(lowercase)する
+fn parse_word_list(text: &str) -> Vec<String> {
+    text.split([',', ' ', '\n'])
+        .map(str::trim)
+        .filter(|w| WORD_RE.is_match(w))
+        .map(|w| w.to_lowercase())
+        .collect()
+}
+
+/// ルーム選択HTML(表示名)
+fn room_options_html(rooms: &[(u64, String)], default_all: bool) -> String {
+    let mut html = if default_all {
+        r#"<option value="">全ルーム</option>"#.to_string()
+    } else {
+        String::new()
+    };
+    for (id, name) in rooms {
+        html.push_str(&format!(
+            r#"<option value="{id}">{}</option>"#,
+            escape_html_basic(name)
+        ));
+    }
+    html
+}
+
+/// 管理操作の結果ページ
+fn management_result(title: &str, messages: &[String]) -> Response {
+    let mut html = SHARED_PAGE_HEAD.to_string();
+    html.push_str(&format!("<h1>{}</h1>\n<ul>", escape_html_basic(title)));
+    for msg in messages {
+        html.push_str(&format!("<li>{}</li>", escape_html_basic(msg)));
+    }
+    html.push_str("</ul><p><a href=\"/admin\">管理画面へ戻る</a></p>");
+    html.push_str("</body></html>");
+    Html(html).into_response()
+}
+
+/// 変更を即時保存する
+async fn save_now(state: &AppState) -> Option<String> {
+    state
+        .manager
+        .save_file(&state.data_path)
+        .await
+        .err()
+        .map(|e| format!("保存に失敗しました: {e}"))
+}
+
+/// POST /admin/room/add : ルーム追加(名前は任意)
+pub async fn room_add(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    form: Form<RoomForm>,
+) -> Response {
+    if require_session(&state, &headers).is_err() {
+        return Redirect::to("/admin/login").into_response();
+    }
+    if !is_same_origin(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            Html("不正な送信元のため拒否しました。".to_string()),
+        )
+            .into_response();
+    }
+
+    let mut messages = Vec::new();
+    match form.room_id.trim().parse::<u64>() {
+        Ok(room_id) => {
+            let existed = state.manager.has_room(room_id).await;
+            state.manager.get_or_new_room(room_id).await;
+            let name = form.name.trim().to_string();
+            if !name.is_empty() {
+                state.manager.set_room_name(room_id, name).await;
+            }
+            messages.push(if existed {
+                format!("ルーム {room_id} は既に存在します(既存データは保持)。")
+            } else {
+                format!("ルーム {room_id} を追加しました。")
+            });
+            if let Some(err) = save_now(&state).await {
+                messages.push(err);
+            }
+        }
+        Err(_) => messages.push(
+            "room_id が正しくありません(数字のDiscordチャンネルIDで指定してください)。".to_string(),
+        ),
+    }
+
+    management_result("ルーム追加", &messages)
+}
+
+/// POST /admin/room/delete : ルーム削除
+pub async fn room_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    form: Form<RoomForm>,
+) -> Response {
+    if require_session(&state, &headers).is_err() {
+        return Redirect::to("/admin/login").into_response();
+    }
+    if !is_same_origin(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            Html("不正な送信元のため拒否しました。".to_string()),
+        )
+            .into_response();
+    }
+
+    let mut messages = Vec::new();
+    match form.room_id.trim().parse::<u64>() {
+        Ok(room_id) => {
+            if state.manager.delete_room(room_id).await {
+                messages.push(format!("ルーム {room_id} を削除しました。"));
+                if let Some(err) = save_now(&state).await {
+                    messages.push(err);
+                }
+            } else {
+                messages.push(format!("ルーム {room_id} は存在しません。"));
+            }
+        }
+        Err(_) => messages.push("room_id が正しくありません。".to_string()),
+    }
+
+    management_result("ルーム削除", &messages)
+}
+
+/// POST /admin/word/add : 単語追加(ルームは既存のみ)
+pub async fn word_add(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    form: Form<WordForm>,
+) -> Response {
+    if require_session(&state, &headers).is_err() {
+        return Redirect::to("/admin/login").into_response();
+    }
+    if !is_same_origin(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            Html("不正な送信元のため拒否しました。".to_string()),
+        )
+            .into_response();
+    }
+
+    let mut messages = Vec::new();
+    match form.room_id.trim().parse::<u64>() {
+        Ok(room_id) if state.manager.has_room(room_id).await => {
+            let words = parse_word_list(&form.words);
+            let room_arc = state.manager.get_or_new_room(room_id).await;
+            let mut room = room_arc.write().await;
+            let added = room.words.add_words(&words);
+            drop(room);
+
+            if added.is_empty() {
+                messages.push("追加された単語はありません(不正な形式または登録済み)。".to_string());
+            } else {
+                let list: Vec<String> = added.iter().map(|w| escape_html_basic(w)).collect();
+                messages.push(format!(
+                    "{}語を追加しました: {}",
+                    added.len(),
+                    list.join(", ")
+                ));
+            }
+            if let Some(err) = save_now(&state).await {
+                messages.push(err);
+            }
+        }
+        Ok(room_id) => messages.push(format!(
+            "ルーム {room_id} は存在しません(先にルームを追加してください)。"
+        )),
+        Err(_) => messages.push("room_id が正しくありません。".to_string()),
+    }
+
+    management_result("単語追加", &messages)
+}
+
+/// POST /admin/word/delete : 単語削除(評価済み完全一致)
+pub async fn word_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    form: Form<WordForm>,
+) -> Response {
+    if require_session(&state, &headers).is_err() {
+        return Redirect::to("/admin/login").into_response();
+    }
+    if !is_same_origin(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            Html("不正な送信元のため拒否しました。".to_string()),
+        )
+            .into_response();
+    }
+
+    let mut messages = Vec::new();
+    match form.room_id.trim().parse::<u64>() {
+        Ok(room_id) if state.manager.has_room(room_id).await => {
+            let words = parse_word_list(&form.words);
+            if words.is_empty() {
+                messages.push("削除する単語が指定されていません。".to_string());
+            } else {
+                let room_arc = state.manager.get_or_new_room(room_id).await;
+                let mut room = room_arc.write().await;
+                let mut removed = Vec::new();
+                let mut not_found = Vec::new();
+                for word in &words {
+                    if room.words.remove_word(word) {
+                        removed.push(escape_html_basic(word));
+                    } else {
+                        not_found.push(escape_html_basic(word));
+                    }
+                }
+                drop(room);
+
+                if !removed.is_empty() {
+                    messages.push(format!("削除した単語: {}", removed.join(", ")));
+                }
+                if !not_found.is_empty() {
+                    messages.push(format!(
+                        "辞書に無く削除できなかった単語: {}",
+                        not_found.join(", ")
+                    ));
+                }
+                if let Some(err) = save_now(&state).await {
+                    messages.push(err);
+                }
+            }
+        }
+        Ok(room_id) => messages.push(format!("ルーム {room_id} は存在しません。")),
+        Err(_) => messages.push("room_id が正しくありません。".to_string()),
+    }
+
+    management_result("単語削除", &messages)
 }
 
 /// GET /admin/export : 現在のデータを新形式JSONでダウンロード
@@ -739,5 +1027,174 @@ mod tests {
         assert!(r.words.contains("pear"));
         drop(r);
         assert_eq!(summary.words_added, 1);
+    }
+    // ===== 単語・ルーム管理のテスト =====
+
+    #[test]
+    fn admin_parse_word_list_normalizes() {
+        assert_eq!(
+            parse_word_list("Apple, banana  cherry\nDOG"),
+            vec!["apple", "banana", "cherry", "dog"]
+        );
+        // 記号を含む語は除外(空白で分かれた1語は !addwords と同じく個別に受理)
+        assert_eq!(
+            parse_word_list("two words bad_word, cat"),
+            vec!["two", "words", "cat"]
+        );
+    }
+
+    fn authed(state: &AppState) -> HeaderMap {
+        authed_headers(state)
+    }
+
+    #[tokio::test]
+    async fn room_add_creates_and_sets_name() {
+        use std::fs;
+        fs::create_dir_all("/tmp/shiritori_test_admin/room").unwrap();
+        let mut state = test_state();
+        state.data_path = "/tmp/shiritori_test_admin/room/data.json".to_string();
+
+        // 未認証は拒否
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("dict.test"));
+        headers.insert(header::ORIGIN, HeaderValue::from_static("http://dict.test"));
+        let response = room_add(
+            State(state.clone()),
+            headers,
+            Form(RoomForm {
+                room_id: "123".into(),
+                name: "Srv/ch".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(state.manager.room_ids().await.is_empty());
+
+        // 認証済みで追加
+        let response = room_add(
+            State(state.clone()),
+            authed(&state),
+            Form(RoomForm {
+                room_id: "123".into(),
+                name: "Srv/ch".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state.manager.room_display().await,
+            vec![(123, "Srv/ch".to_string())]
+        );
+        // 即時保存されている
+        let disk = fs::read_to_string("/tmp/shiritori_test_admin/room/data.json").unwrap();
+        assert!(disk.contains("Srv/ch"));
+
+        // 不正ID
+        let response = room_add(
+            State(state.clone()),
+            authed(&state),
+            Form(RoomForm {
+                room_id: "x".into(),
+                name: String::new(),
+            }),
+        )
+        .await;
+        let body = body_text(response).await;
+        assert!(body.contains("room_id が正しくありません"));
+    }
+
+    #[tokio::test]
+    async fn room_delete_removes_room() {
+        use std::fs;
+        fs::create_dir_all("/tmp/shiritori_test_admin/roomdel").unwrap();
+        let mut state = test_state();
+        state.data_path = "/tmp/shiritori_test_admin/roomdel/data.json".to_string();
+        state.manager.get_or_new_room(555).await;
+
+        let response = room_delete(
+            State(state.clone()),
+            authed(&state),
+            Form(RoomForm {
+                room_id: "555".into(),
+                name: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!state.manager.has_room(555).await);
+        assert!(state.manager.room_ids().await.is_empty());
+
+        // 2回目は「存在しません」
+        let response = room_delete(
+            State(state.clone()),
+            authed(&state),
+            Form(RoomForm {
+                room_id: "555".into(),
+                name: String::new(),
+            }),
+        )
+        .await;
+        let body = body_text(response).await;
+        assert!(body.contains("存在しません"));
+    }
+
+    #[tokio::test]
+    async fn word_add_and_delete_operate_on_room_dictionary() {
+        use std::fs;
+        fs::create_dir_all("/tmp/shiritori_test_admin/word").unwrap();
+        let mut state = test_state();
+        state.data_path = "/tmp/shiritori_test_admin/word/data.json".to_string();
+        state.manager.get_or_new_room(888).await;
+
+        // 追加
+        let response = word_add(
+            State(state.clone()),
+            authed(&state),
+            Form(WordForm {
+                room_id: "888".into(),
+                words: "Apple, banana bad_word".into(),
+            }),
+        )
+        .await;
+        let body = body_text(response).await;
+        assert!(body.contains("2語を追加しました"));
+        let room = state.manager.get_or_new_room(888).await;
+        assert!(room.read().await.words.contains("apple"));
+        assert!(!room.read().await.words.contains("bad_word"));
+
+        // 削除(評価済み完全一致・大文字でも可)
+        let response = word_delete(
+            State(state.clone()),
+            authed(&state),
+            Form(WordForm {
+                room_id: "888".into(),
+                words: "APPLE, missing".into(),
+            }),
+        )
+        .await;
+        let body = body_text(response).await;
+        assert!(body.contains("削除した単語: apple"));
+        assert!(body.contains("削除できなかった単語: missing"));
+        let room = state.manager.get_or_new_room(888).await;
+        assert!(!room.read().await.words.contains("apple"));
+        drop(room);
+
+        // 保存に反映
+        let disk = fs::read_to_string("/tmp/shiritori_test_admin/word/data.json").unwrap();
+        assert!(disk.contains("banana"));
+        assert!(!disk.contains("apple"));
+
+        // 存在しないルーム
+        let response = word_add(
+            State(state.clone()),
+            authed(&state),
+            Form(WordForm {
+                room_id: "999".into(),
+                words: "cat".into(),
+            }),
+        )
+        .await;
+        let body = body_text(response).await;
+        assert!(body.contains("存在しません"));
     }
 }

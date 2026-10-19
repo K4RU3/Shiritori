@@ -59,6 +59,9 @@ pub struct VoteData {
 /// ルーム1つ分の永続データ
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RoomData {
+    /// 表示名(主に サーバー名/チャンネル名)。なければ省略
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// ユーザーの回答順
     pub user_queue: Vec<u64>,
     /// 辞書(回答済み単語)
@@ -99,6 +102,8 @@ impl SaveData {
 #[derive(Debug, Clone, Default)]
 pub struct RoomState {
     pub room_id: u64,
+    /// 表示名(主に サーバー名/チャンネル名)
+    pub name: Option<String>,
     pub user_queue: Vec<u64>,
     pub words: WordStore,
     pub vote: Option<VoteData>,
@@ -115,6 +120,7 @@ impl RoomState {
     /// 永続データへ変換
     fn to_data(&self) -> RoomData {
         RoomData {
+            name: self.name.clone(),
             user_queue: self.user_queue.clone(),
             words: self.words.clone(),
             vote: self.vote.clone(),
@@ -125,6 +131,7 @@ impl RoomState {
     fn from_data(room_id: u64, data: RoomData) -> Self {
         Self {
             room_id,
+            name: data.name,
             user_queue: data.user_queue,
             words: data.words,
             vote: data.vote,
@@ -175,6 +182,40 @@ impl RoomManager {
     /// 登録済みルームID一覧
     pub async fn room_ids(&self) -> Vec<u64> {
         self.rooms.read().await.keys().copied().collect()
+    }
+
+    /// ルームの表示名を設定する(部屋が無ければ作成する)
+    pub async fn set_room_name(&self, room_id: u64, name: String) {
+        let room_arc = self.get_or_new_room(room_id).await;
+        room_arc.write().await.name = Some(name);
+    }
+
+    /// ルームを削除する(辞書・キュー・投票ごと消える)。存在した場合は true
+    pub async fn delete_room(&self, room_id: u64) -> bool {
+        self.rooms.write().await.remove(&room_id).is_some()
+    }
+
+    /// 全ルームの (room_id, 表示名) 一覧。名前付きルームを表示名順、
+    /// 未登録ルームは ID の文字列でその後に並べる
+    pub async fn room_display(&self) -> Vec<(u64, String)> {
+        #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+        enum Key {
+            Named(String, u64),
+            Unnamed(u64),
+        }
+
+        let rooms = self.rooms.read().await;
+        let mut list = Vec::with_capacity(rooms.len());
+        for (id, arc) in rooms.iter() {
+            let name = arc.read().await.name.clone();
+            match name {
+                Some(name) => list.push((Key::Named(name.to_lowercase(), *id), (*id, name))),
+                None => list.push((Key::Unnamed(*id), (*id, id.to_string()))),
+            }
+        }
+        drop(rooms);
+        list.sort_by(|a, b| a.0.cmp(&b.0));
+        list.into_iter().map(|(_, pair)| pair).collect()
     }
 
     /// 現在の状態を SaveData にスナップショットする
@@ -295,6 +336,7 @@ mod tests {
         let mut words = WordStore::new();
         words.add_words(["apple", "grape"]);
         RoomData {
+            name: Some("Test Server/test-room".to_string()),
             user_queue: vec![111, 222, 333],
             words,
             vote: Some(vote_sample()),
@@ -340,6 +382,7 @@ mod tests {
         data.rooms.insert(
             123,
             RoomData {
+                name: None,
                 user_queue: vec![],
                 words: WordStore::new(),
                 vote: None,
@@ -464,5 +507,47 @@ mod tests {
         assert_eq!(restored.user_queue, vec![10, 20]);
         assert!(restored.words.contains("cat"));
         assert_eq!(restored.vote.unwrap().message_id, 999);
+    }
+
+    #[tokio::test]
+    async fn set_room_name_and_display_order_fallback() {
+        let manager = RoomManager::new();
+        manager.set_room_name(2000, "Beta/gamma".to_string()).await;
+        manager.set_room_name(1000, "Alpha/beta".to_string()).await;
+        manager.get_or_new_room(3000).await; // 名前なしルーム
+
+        let list = manager.room_display().await;
+        assert_eq!(
+            list,
+            vec![
+                (1000, "Alpha/beta".to_string()),
+                (2000, "Beta/gamma".to_string()),
+                (3000, "3000".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn room_name_survives_save_load() {
+        let manager = RoomManager::new();
+        manager
+            .set_room_name(42, "MyServer/general".to_string())
+            .await;
+        let path = "/tmp/shiritori_test_data_name/data.json";
+        manager.save_file(path).await.unwrap();
+
+        let loaded = RoomManager::load_file(path).await.unwrap();
+        assert_eq!(
+            loaded.room_display().await,
+            vec![(42, "MyServer/general".to_string())]
+        );
+    }
+
+    #[test]
+    fn room_data_without_name_loads_backcompat() {
+        // v4 旧保存データ(名前フィールドなし)はそのまま読める
+        let json = r#"{"user_queue":[],"words":[]}"#;
+        let data: RoomData = serde_json::from_str(json).unwrap();
+        assert!(data.name.is_none());
     }
 }

@@ -85,6 +85,18 @@ impl WordStore {
         true
     }
 
+    /// 単語を削除する。実際に削除された場合 true(正規化した完全一致)
+    pub fn remove_word(&mut self, word: &str) -> bool {
+        let normalized = Self::normalize(word);
+        if !self.set.remove(&normalized) {
+            return false;
+        }
+        if let Ok(pos) = self.words.binary_search(&normalized) {
+            self.words.remove(pos);
+        }
+        true
+    }
+
     /// 複数単語を追加し、実際に追加された単語を返す
     pub fn add_words<I: IntoIterator>(&mut self, words: I) -> Vec<String>
     where

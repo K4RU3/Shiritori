@@ -193,6 +193,34 @@ impl Handler {
         }
     }
 
+    /// ルームの表示名(サーバー名/チャンネル名)をキャッシュから取得する
+    ///
+    /// 名前が解決できない(ネットワークエラー等)場合は None を返す。
+    async fn snapshot_room_name(&self, ctx: &Context, room_id: u64) -> Option<String> {
+        // Cache::channel は非推奨のため、ギルドごとにチャンネルを走査して探す
+        let channel_id = ChannelId::new(room_id);
+        for guild_id in ctx.cache.guilds() {
+            let Some(guild) = ctx.cache.guild(guild_id) else {
+                continue;
+            };
+            if let Some(channel) = guild.channels.get(&channel_id) {
+                return Some(format!("{}/{}", guild.name, channel.name));
+            }
+        }
+        None
+    }
+
+    /// 名前がわかるルームについて、表示名をキャッシュから更新する
+    ///
+    /// 未登録のルームは作らない。
+    async fn refresh_room_names(&self, ctx: &Context) {
+        for room_id in self.bot.manager.room_ids().await {
+            if let Some(name) = self.snapshot_room_name(ctx, room_id).await {
+                self.bot.manager.set_room_name(room_id, name).await;
+            }
+        }
+    }
+
     /// リアクションイベント(add/remove共通)
     async fn handle_reaction(&self, ctx: Context, reaction: Reaction, added: bool) {
         // ボット自身のリアクションは無視
@@ -251,6 +279,10 @@ impl EventHandler for Handler {
         // ボットへのメンション → チャンネル登録 + slashコマンド登録
         if msg.mentions_me(&ctx).await.unwrap_or(false) {
             let fresh = engine::register_room(&self.bot, room_id).await;
+            // 表示名(サーバー名/チャンネル名)をキャッシュから記録
+            if let Some(name) = self.snapshot_room_name(&ctx, room_id).await {
+                self.bot.manager.set_room_name(room_id, name).await;
+            }
             if let Some(guild_id) = msg.guild_id {
                 self.ensure_commands_registered(&ctx, guild_id).await;
             }
@@ -342,8 +374,11 @@ impl EventHandler for Handler {
         }
     }
 
-    async fn ready(&self, _: Context, ready: Ready) {
+    async fn ready(&self, ctx: Context, ready: Ready) {
         println!("{} is connected! (v4)", ready.user.name);
+        // 登録済みルームの表示名をキャッシュから更新(v4以前のデータや
+        // 再起動前の名前変更を反映・接続直後のためキャッシュが不完全でも問題ない)
+        self.refresh_room_names(&ctx).await;
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {

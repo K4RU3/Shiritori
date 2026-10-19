@@ -364,6 +364,7 @@ mod tests {
         let mut words = crate::words::WordStore::new();
         words.add_word("cat");
         let data = RoomData {
+            name: None,
             user_queue: vec![1],
             words,
             vote: None,

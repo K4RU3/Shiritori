@@ -10,6 +10,7 @@
 pub mod admin;
 pub mod migration;
 pub mod search;
+pub mod words;
 
 use std::{
     collections::HashSet,
@@ -17,7 +18,11 @@ use std::{
 };
 
 use crate::data::RoomManager;
-use axum::{Router, http::StatusCode, routing::get};
+use axum::{
+    Router,
+    http::StatusCode,
+    routing::{get, post},
+};
 
 /// Web設定
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,11 +121,16 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(search::page))
         .route("/search", get(search::page))
+        .route("/words", get(words::page))
         .route("/admin/login", get(admin::login_form).post(admin::login))
         .route("/admin", get(admin::dashboard))
         .route("/admin/export", get(admin::export))
         .route("/admin/logout", get(admin::logout))
         .route("/admin/upload", get(admin::upload_form).post(admin::upload))
+        .route("/admin/room/add", post(admin::room_add))
+        .route("/admin/room/delete", post(admin::room_delete))
+        .route("/admin/word/add", post(admin::word_add))
+        .route("/admin/word/delete", post(admin::word_delete))
         .route("/healthz", get(healthz))
         .with_state(state)
 }

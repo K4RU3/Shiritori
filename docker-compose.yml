@@ -5,6 +5,7 @@
 #
 # 必要な環境変数は .env ファイルか environment で指定する:
 #   DISCORD_BOT_TOKEN=...        (必須)
+#   SHIRITORI_PORT=8080          (ホスト側ポート。省略時 8080)
 #   WEB_BIND=0.0.0.0:8080        (Web機能。以下3つが揃った場合のみ有効)
 #   WEB_PUBLIC_URL=https://...   (ユーザー遷移用公開アドレス)
 #   WEB_PASSWORD=...             (管理画面パスワード)
@@ -23,10 +24,11 @@ services:
       - DATA_DIR=/data
     volumes:
       - shiritori-data:/data
-    # Web機能を有効にした場合はポートを公開する
+    # Web機能を有効にした場合はポートを公開する。
+    # ホスト側ポートは SHIRITORI_PORT で変更できる(コンテナ内は WEB_BIND の設定次第)。
     # (WEB_BIND=0.0.0.0:8080 を設定した場合のみ待ち受ける)
     ports:
-      - "8080:8080"
+      - "${SHIRITORI_PORT:-8080}:8080"
 
 volumes:
   shiritori-data:

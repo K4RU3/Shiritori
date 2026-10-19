@@ -86,6 +86,7 @@ cargo run --release
 |---|---|---|
 | `DISCORD_BOT_TOKEN` | ✔ | Discord ボットトークン |
 | `DATA_DIR` | | データディレクトリ(`${DATA_DIR}/data.json` に保存。省略時 `./data`) |
+| `SHIRITORI_PORT` | | Docker使用時のホスト側ポート(compose が `${SHIRITORI_PORT:-8080}:8080` に展開。省略時 8080) |
 | `WEB_BIND` | | Web サーバーの待ち受けアドレス(例: `0.0.0.0:8080`) |
 | `WEB_PUBLIC_URL` | | ユーザー遷移用の公開アドレス(辞書検索ページへのリンクに使用) |
 | `WEB_PASSWORD` | | 管理画面のパスワード |
@@ -136,8 +137,10 @@ docker compose up -d --build
 ```
 
 `.env` に `DISCORD_BOT_TOKEN`(必須)と任意で Web 用の 3 変数を記載しておいて
-ください。データは Docker ボリューム `shiritori-data` の `/data/data.json` に
-保存され、コンテナを削除・再作成しても引き継がれます。
+ください。ホスト側ポートを変えたい場合は `SHIRITORI_PORT=12345` を `.env`
+に追記します(コンテナ内ポートは変わりません)。データは Docker ボリューム
+`shiritori-data` の `/data/data.json` に保存され、コンテナを削除・再作成して
+も引き継がれます。
 
 ボットは数年単位の連続稼働を想定しています:
 
