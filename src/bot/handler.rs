@@ -7,7 +7,10 @@
 
 use std::{
     collections::HashSet,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use lazy_static::lazy_static;
@@ -154,12 +157,19 @@ impl Messenger for DiscordMessenger {
     }
 }
 
+/// ルーム名の定期再取得間隔(秒)
+const NAME_REFRESH_INTERVAL_SECS: u64 = 600;
+
 /// Serenity イベントハンドラ
 pub struct Handler {
     /// ボット本体
     pub bot: Bot,
     /// プロセス内でslashコマンドを登録済みのGuild(ID)集合
     pub registered_guilds: Arc<Mutex<HashSet<u64>>>,
+    /// ルーム名の更新要求(Web側のインポート完了などから通知される)
+    pub name_refresh: Arc<tokio::sync::Notify>,
+    /// 名前更新ループが起動済みか(readyの二重発火対策)
+    pub name_loop_started: AtomicBool,
 }
 
 impl Handler {
@@ -167,7 +177,15 @@ impl Handler {
         Self {
             bot,
             registered_guilds: Arc::new(Mutex::new(HashSet::new())),
+            name_refresh: Arc::new(tokio::sync::Notify::new()),
+            name_loop_started: AtomicBool::new(false),
         }
+    }
+
+    /// ルーム名更新要求のNotifyを差し替える(Web側と同じNotifyを共有)
+    pub fn with_name_refresh(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.name_refresh = notify;
+        self
     }
 
     /// slashコマンドをGuildに登録する(プロセス内で1回のみ)
@@ -190,34 +208,6 @@ impl Handler {
                 .lock()
                 .expect("mutex poisoned")
                 .insert(guild_id.get());
-        }
-    }
-
-    /// ルームの表示名(サーバー名/チャンネル名)をキャッシュから取得する
-    ///
-    /// 名前が解決できない(ネットワークエラー等)場合は None を返す。
-    async fn snapshot_room_name(&self, ctx: &Context, room_id: u64) -> Option<String> {
-        // Cache::channel は非推奨のため、ギルドごとにチャンネルを走査して探す
-        let channel_id = ChannelId::new(room_id);
-        for guild_id in ctx.cache.guilds() {
-            let Some(guild) = ctx.cache.guild(guild_id) else {
-                continue;
-            };
-            if let Some(channel) = guild.channels.get(&channel_id) {
-                return Some(format!("{}/{}", guild.name, channel.name));
-            }
-        }
-        None
-    }
-
-    /// 名前がわかるルームについて、表示名をキャッシュから更新する
-    ///
-    /// 未登録のルームは作らない。
-    async fn refresh_room_names(&self, ctx: &Context) {
-        for room_id in self.bot.manager.room_ids().await {
-            if let Some(name) = self.snapshot_room_name(ctx, room_id).await {
-                self.bot.manager.set_room_name(room_id, name).await;
-            }
         }
     }
 
@@ -266,6 +256,34 @@ impl Handler {
     }
 }
 
+/// ルームの表示名(サーバー名/チャンネル名)をキャッシュから取得する
+///
+/// 名前が解決できない場合(キャッシュに無い・ネットワーク未整備等)は None を返す。
+async fn snapshot_room_name(ctx: &Context, room_id: u64) -> Option<String> {
+    // Cache::channel は非推奨のため、ギルドごとにチャンネルを走査して探す
+    let channel_id = ChannelId::new(room_id);
+    for guild_id in ctx.cache.guilds() {
+        let Some(guild) = ctx.cache.guild(guild_id) else {
+            continue;
+        };
+        if let Some(channel) = guild.channels.get(&channel_id) {
+            return Some(format!("{}/{}", guild.name, channel.name));
+        }
+    }
+    None
+}
+
+/// 名前がわかる全ルームについて、表示名をキャッシュから更新する
+///
+/// 未登録のルームは作らない。import直後・起動直後・チャンネル名変更後などに呼ぶ。
+async fn refresh_room_names(ctx: &Context, manager: &crate::RoomManager) {
+    for room_id in manager.room_ids().await {
+        if let Some(name) = snapshot_room_name(ctx, room_id).await {
+            manager.set_room_name(room_id, name).await;
+        }
+    }
+}
+
 #[async_trait]
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
@@ -280,7 +298,7 @@ impl EventHandler for Handler {
         if msg.mentions_me(&ctx).await.unwrap_or(false) {
             let fresh = engine::register_room(&self.bot, room_id).await;
             // 表示名(サーバー名/チャンネル名)をキャッシュから記録
-            if let Some(name) = self.snapshot_room_name(&ctx, room_id).await {
+            if let Some(name) = snapshot_room_name(&ctx, room_id).await {
                 self.bot.manager.set_room_name(room_id, name).await;
             }
             if let Some(guild_id) = msg.guild_id {
@@ -378,7 +396,34 @@ impl EventHandler for Handler {
         println!("{} is connected! (v4)", ready.user.name);
         // 登録済みルームの表示名をキャッシュから更新(v4以前のデータや
         // 再起動前の名前変更を反映・接続直後のためキャッシュが不完全でも問題ない)
-        self.refresh_room_names(&ctx).await;
+        refresh_room_names(&ctx, &self.bot.manager).await;
+
+        // 名前更新ループを一度だけ起動する:
+        // - Web側のインポート完了通知(Notify)または10分ごとに全ルーム名を再取得
+        // - readyが再発火しても二重起動しない
+        if self
+            .name_loop_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let ctx = ctx.clone();
+        let manager = self.bot.manager.clone();
+        let notify = self.name_refresh.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(NAME_REFRESH_INTERVAL_SECS));
+            // 初回tickは即時なので、loop内でselectしない(起動直後の再更新はready側が担保)
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = notify.notified() => {},
+                    _ = interval.tick() => {},
+                }
+                refresh_room_names(&ctx, &manager).await;
+            }
+        });
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {

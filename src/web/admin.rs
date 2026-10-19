@@ -649,6 +649,11 @@ pub async fn upload(
     let input = extract_upload(multipart).await;
     let (summary, errors) = apply_import(&state.manager, &state.data_path, &input).await;
 
+    // ルーム名が未確定(v3由来はID表示)なのでBotに名前の再取得を促す
+    if summary.rooms_created > 0 || summary.rooms_updated > 0 {
+        state.request_name_refresh();
+    }
+
     // 結果ページ
     let mut html = SHARED_PAGE_HEAD.to_string();
     html.push_str("<h1>インポート結果</h1>\n<ul>");
@@ -750,6 +755,11 @@ pub async fn import_v4_post(
             Err(errors)
         }
     };
+
+    // v4インポート成功時も、名前のないルームが含まれる可能性があるため再取得を促す
+    if result.is_ok() {
+        state.request_name_refresh();
+    }
 
     let mut html = SHARED_PAGE_HEAD.to_string();
     match result {

@@ -47,7 +47,9 @@ async fn main() {
     // 公開URLは辞書検索ページへのリンクに利用(Web有効時のみ)
     let web_url = web_config.as_ref().map(|c| c.public_url.clone());
     let bot = Bot::new(manager.clone(), Arc::new(NoopMeaningProvider), web_url);
-    let handler = Handler::new(bot.clone());
+    // ルーム名の更新要求チャネル: Web側(インポート完了)から Handler へ通知する
+    let name_refresh = Arc::new(tokio::sync::Notify::new());
+    let handler = Handler::new(bot.clone()).with_name_refresh(name_refresh.clone());
 
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT
@@ -64,7 +66,8 @@ async fn main() {
     // Webサーバー起動(失敗してもプロセスは継続)
     if let Some(config) = web_config {
         let web_state =
-            shiritori_v4::web::AppState::new(config.clone(), manager.clone(), path.clone());
+            shiritori_v4::web::AppState::new(config.clone(), manager.clone(), path.clone())
+                .with_name_refresh(name_refresh.clone());
         match shiritori_v4::web::serve(web_state).await {
             Ok(addr) => println!("Webサーバー起動: {addr}"),
             Err(e) => eprintln!("Webサーバー起動に失敗(無視して継続): {e}"),

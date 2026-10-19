@@ -78,6 +78,9 @@ pub struct AppState {
     /// data.json のパス(出力用)
     pub data_path: String,
     pub sessions: Sessions,
+    /// 名前更新要求(notify_one で Handler にルーム名再取得を促す)。
+    /// Bot無しでの単体テスト時は None
+    pub name_refresh: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl AppState {
@@ -87,6 +90,20 @@ impl AppState {
             manager,
             data_path,
             sessions: Arc::new(Mutex::new(HashSet::new())),
+            name_refresh: None,
+        }
+    }
+
+    /// 名前更新要求用のNotifyを設定する(main配線時にBotのHandlerへ橋渡し)
+    pub fn with_name_refresh(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.name_refresh = Some(notify);
+        self
+    }
+
+    /// 名前更新を要求する(Botあり運用でのみ意味を持つ)
+    pub fn request_name_refresh(&self) {
+        if let Some(notify) = &self.name_refresh {
+            notify.notify_one();
         }
     }
 }
