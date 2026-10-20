@@ -32,8 +32,11 @@ use crate::{
 };
 
 lazy_static! {
-    /// 英単語1語(単語を構成するのは英字とハイフンのみ)
-    static ref REGEX_WORD: Regex = Regex::new(r"^[a-zA-Z][a-zA-Z\-]*$").unwrap();
+    /// 英単語フレーズ(スペース区切りの複数英字トークンも1つの回答として受理)
+    /// 業形式は英字/ハイフンの1トークンを空白(半角1個)で連結したもの。
+    /// vote/辞書登録時には WordStore::normalize で trim+空白圧縮が行われる
+    static ref REGEX_WORD: Regex =
+        Regex::new(r"^[a-zA-Z][a-zA-Z\-]*(?:\s+[a-zA-Z][a-zA-Z\-]*)*$").unwrap();
     /// メンション表記
     static ref REGEX_MENTION: Regex = Regex::new(r"<@!?(\d+)>").unwrap();
 }
@@ -557,12 +560,16 @@ fn parse_mentions(text: &str) -> Vec<u64> {
         .collect()
 }
 
-/// カンマ/空白区切りの英単語リストを正規化して収集
+/// カンマ区切りの英単語(フレーズ可)リストを正規化して収集
+///
+/// フレーズ("donkey kong"等)のスペースは要素として保持するため、
+/// 区切りはカンマのみでトークン内の空白は正規化(trim+連続圧縮)される。
 fn parse_word_list(text: &str) -> Vec<String> {
-    text.split([',', ' '])
+    text.split(',')
         .map(str::trim)
         .filter(|w| REGEX_WORD.is_match(w))
-        .map(|w| w.to_lowercase())
+        .map(crate::words::WordStore::normalize)
+        .filter(|w| !w.is_empty())
         .collect()
 }
 
@@ -646,10 +653,19 @@ mod tests {
     fn parse_word_list_normalizes() {
         let words = parse_word_list("Apple, GRAPE, banana");
         assert_eq!(words, vec!["apple", "grape", "banana"]);
-        // 不正要素は除外される
-        // 分割は空白でも行われるため各トークンごとに妥当性判定される
-        let words = parse_word_list("ok, あいう, with space, valid-word");
-        assert_eq!(words, vec!["ok", "with", "space", "valid-word"]);
+        // 不正要素は除外される(日本語・複数トークン混入等)
+        let words = parse_word_list("ok, あいう, bad_word, valid-word");
+        assert_eq!(words, vec!["ok", "valid-word"]);
+    }
+
+    #[test]
+    fn parse_word_list_keeps_phrases() {
+        // フレーズはスペースを保持して1つにまとまる
+        let words = parse_word_list("donkey kong, out  of  space");
+        assert_eq!(words, vec!["donkey kong", "out of space"]);
+        // 空要素は除去
+        let words = parse_word_list("alpha,,,, beta");
+        assert_eq!(words, vec!["alpha", "beta"]);
     }
 
     #[test]

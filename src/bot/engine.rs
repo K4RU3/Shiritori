@@ -822,6 +822,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn phrase_answer_normalized_and_vote_registered() {
+        // "donkey kong" のようなフレーズ(空白含む)も1つの回答として扱う
+        // 空白/大文字の揺れは全部 WordStore::normalize で正規化される
+        let bot = test_bot();
+        let fake = std::sync::Arc::new(FakeMessenger::default());
+        let msgr: SharedMessenger = fake.clone();
+        set_queue(&msgr, &bot.manager, 1000, vec![1, 2, 3]).await;
+
+        try_word(&bot, &msgr, 1000, 1, "  Donkey   kong ").await;
+        settle_background_tasks().await;
+
+        let vote_msg = 2;
+        let body = fake.last_edit(vote_msg).unwrap();
+        assert!(body.contains("「donkey kong」")); // trim + 空白圧縮 + lowercase
+        let (_, vote, _) = read_room(&bot, 1000).await;
+        assert_eq!(word_of(&vote), Some("donkey kong".to_string()));
+
+        // 可決で辞書に登録(圧縮済みの形で1エントリ)
+        apply_vote(&bot, &msgr, 1000, 2, true, false).await;
+        apply_vote(&bot, &msgr, 1000, 3, true, false).await;
+        let (_, _, words) = read_room(&bot, 1000).await;
+        assert_eq!(words, vec!["donkey kong".to_string()]);
+
+        // 再回答(空白/大文字違い)は完全一致で即棄却・投票は立たない
+        let before = 2; // 送信済み: キュー設定(1) + 可決投票(2)。次のプレースホルダーは before+1
+        try_word(&bot, &msgr, 1000, 2, "DONKEY    KONG").await;
+        settle_background_tasks().await;
+        let edited = fake.last_edit(before + 1).unwrap();
+        assert_eq!(edited, m::already_answered("donkey kong"));
+        let (_, vote, _) = read_room(&bot, 1000).await;
+        assert!(vote.is_none());
+        assert_eq!(words, vec!["donkey kong".to_string()]);
+    }
+
+    #[tokio::test]
     async fn reactions_drive_votes_with_exclusive_removal() {
         let bot = test_bot();
         let fake = std::sync::Arc::new(FakeMessenger::default());

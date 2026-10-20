@@ -1,6 +1,6 @@
 //! チャンネル単位の単語辞書ストア
 //!
-//! - 正規化: trim + lowercase
+//! - 正規化: trim + lowercase + 連続空白の圧縮(フレーズ対応)
 //! - 完全一致: HashSet / 内部配列 による O(1) 判定
 //! - 前方一致: ソート済み配列の2分探索
 //! - 後方一致 / 部分一致 / あいまい(レーベンシュタイン距離): 全走査
@@ -49,9 +49,15 @@ impl WordStore {
         Self::default()
     }
 
-    /// 単語を正規化する(trim + lowercase)
+    /// 単語を正規化する(trim + lowercase + 連続空白の圧縮)
+    ///
+    /// フレーズ(例: "donkey kong")を1つのエントリとして扱うため、
+    /// 前後の空白を除去し、2連続以上の空白(タブ等含む)は1つの半角スペースに畳む。
     pub fn normalize(word: &str) -> String {
-        word.trim().to_lowercase()
+        word.to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// 正規化済みの単語をすべて返す(ソート済み)
@@ -232,6 +238,19 @@ mod tests {
         assert!(s.contains(" APPLE "));
         assert!(!s.add_word("apple"));
         assert_eq!(s.words(), &["apple".to_string()]);
+    }
+
+    #[test]
+    fn normalize_collapses_whitespace() {
+        // レスポンスの正規化: trim + lowercase + 連続空白圧縮
+        assert_eq!(WordStore::normalize("  Donkey   kONG  "), "donkey kong");
+        assert_eq!(WordStore::normalize("\tdonkey\tkong"), "donkey kong");
+        // 完全一致判定も同一正規化で行われる
+        let mut s = WordStore::new();
+        s.add_word("donkey kong");
+        assert!(s.contains("DONKEY  KONG"));
+        assert!(!s.add_word("donkey   kong"));
+        assert_eq!(s.words(), &["donkey kong".to_string()]);
     }
 
     #[test]

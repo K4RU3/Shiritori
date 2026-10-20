@@ -20,6 +20,8 @@ use serde::Deserialize;
 
 use super::{AppState, SHARED_PAGE_HEAD, migration};
 
+use crate::words::WordStore;
+
 /// 管理セッションCookie名
 pub const COOKIE_NAME: &str = "shiritori_admin_token";
 
@@ -264,16 +266,23 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Respon
 
 // ===== 単語・ルーム管理 =====
 
-/// 加入受付用の英単語の正規表現(1語チェック)
-static WORD_RE: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| regex::Regex::new(r"^[a-zA-Z][a-zA-Z\-]*$").unwrap());
+/// 加入受付用の英単語(フレーズ可)の正規表現
+///
+/// 半角スペース1個を挟んだ複数トークン(例: "donkey kong")も1語として受理する。
+/// 登録時は WordStore::normalize により trim+連続空白圧縮が行われる。
+static WORD_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"^[a-zA-Z][a-zA-Z\-]*(?:\s+[a-zA-Z][a-zA-Z\-]*)*$").unwrap()
+});
 
-/// 入力をカンマ/空白区切りで英単語のみ抽出・正規化(lowercase)する
+/// 入力をカンマ/改行区切りで英単語(フレーズ可)を抽出・正規化(lowercase+空白圧縮)する
+///
+/// フレーズ内のスペースは保持されるため、区切りには空白ではなくカンマ/改行を使う。
 fn parse_word_list(text: &str) -> Vec<String> {
-    text.split([',', ' ', '\n'])
+    text.split(['\n', ','])
         .map(str::trim)
         .filter(|w| WORD_RE.is_match(w))
-        .map(|w| w.to_lowercase())
+        .map(WordStore::normalize)
+        .filter(|w| !w.is_empty())
         .collect()
 }
 
@@ -1194,15 +1203,13 @@ mod tests {
 
     #[test]
     fn admin_parse_word_list_normalizes() {
+        // フレーズ(token間の連続空白含む)も1エントリとして受理
         assert_eq!(
             parse_word_list("Apple, banana  cherry\nDOG"),
-            vec!["apple", "banana", "cherry", "dog"]
+            vec!["apple", "banana cherry", "dog"]
         );
-        // 記号を含む語は除外(空白で分かれた1語は !addwords と同じく個別に受理)
-        assert_eq!(
-            parse_word_list("two words bad_word, cat"),
-            vec!["two", "words", "cat"]
-        );
+        // 記号を含むフレーズは全体が棄却される
+        assert_eq!(parse_word_list("two words bad_word, cat"), vec!["cat"]);
     }
 
     fn authed(state: &AppState) -> HeaderMap {
@@ -1314,7 +1321,7 @@ mod tests {
             authed(&state),
             Form(WordForm {
                 room_id: "888".into(),
-                words: "Apple, banana bad_word".into(),
+                words: "Apple, banana split, bad_word".into(),
             }),
         )
         .await;
@@ -1322,6 +1329,8 @@ mod tests {
         assert!(body.contains("2語を追加しました"));
         let room = state.manager.get_or_new_room(888).await;
         assert!(room.read().await.words.contains("apple"));
+        // フレーズも1語として登録される(空白は正規化される)
+        assert!(room.read().await.words.contains("banana split"));
         assert!(!room.read().await.words.contains("bad_word"));
 
         // 削除(評価済み完全一致・大文字でも可)
@@ -1343,7 +1352,7 @@ mod tests {
 
         // 保存に反映
         let disk = fs::read_to_string("/tmp/shiritori_test_admin/word/data.json").unwrap();
-        assert!(disk.contains("banana"));
+        assert!(disk.contains("banana split"));
         assert!(!disk.contains("apple"));
 
         // 存在しないルーム
